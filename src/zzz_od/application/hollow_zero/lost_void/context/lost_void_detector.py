@@ -1,10 +1,12 @@
 from typing import ClassVar
 
+import cv2
+from cv2.typing import MatLike
+
+from one_dragon.base.debug.debug_trace_bus import DebugTraceBus
 from one_dragon.utils import yolo_config_utils
 from one_dragon.yolo.detect_utils import DetectFrameResult, DetectObjectResult
-from one_dragon.yolo.yolo_utils import get_github_model_download_url
 from one_dragon.yolo.yolov8_onnx_det import Yolov8Detector
-from zzz_od.config.model_config import YOLO_RELEASE_TAG
 
 
 class LostVoidDetector(Yolov8Detector):
@@ -13,15 +15,21 @@ class LostVoidDetector(Yolov8Detector):
     CLASS_DISTANCE: ClassVar[str] = '0001-距离'
     CLASS_ENTRY: ClassVar[str] = 'xxxx-入口'
 
+    # 战斗画面左上头像整片区域(1080p)，包住 头像-3-1/3-2/3-3
+    # 角色头像易被误检为目标，推理前统一涂黑
+    BATTLE_AVATAR_MASK_RECT: ClassVar[tuple[int, int, int, int]] = (104, 40, 844, 110)
+
     def __init__(self,
                  model_name: str,
                  backup_model_name: str,
+                 model_download_url: str,
                  gh_proxy: bool = True,
                  gh_proxy_url: str | None = None,
                  personal_proxy: str | None = None,
                  gpu: bool = False,
-                 keep_result_seconds: float = 2
-                 ):
+                 keep_result_seconds: float = 2,
+                 debug_trace_bus: DebugTraceBus | None = None
+                 ) -> None:
         """
         崩铁用的YOLO模型 参考自 https://github.com/ibaiGorordo/ONNX-YOLOv8-Object-Detection
         :param model_name: 模型名称 在根目录下会有一个以模型名称创建的子文件夹
@@ -34,12 +42,46 @@ class LostVoidDetector(Yolov8Detector):
             model_name=model_name,
             backup_model_name=backup_model_name,
             model_parent_dir_path=yolo_config_utils.get_model_category_dir('lost_void_det'),
-            model_download_url=get_github_model_download_url(YOLO_RELEASE_TAG),
+            model_download_url=model_download_url,
             gh_proxy=gh_proxy,
             gh_proxy_url=gh_proxy_url,
             personal_proxy=personal_proxy,
             gpu=gpu,
-            keep_result_seconds=keep_result_seconds
+            keep_result_seconds=keep_result_seconds,
+            debug_trace_bus=debug_trace_bus
+        )
+
+    def mask_battle_avatars(self, image: MatLike) -> MatLike:
+        """
+        将战斗画面左上角色头像区域涂黑，避免 YOLO 误检
+        :param image: 原始游戏画面
+        :return: 涂黑头像后的画面副本
+        """
+        masked = image.copy()
+        x1, y1, x2, y2 = LostVoidDetector.BATTLE_AVATAR_MASK_RECT
+        cv2.rectangle(masked, (x1, y1), (x2, y2), (0, 0, 0), thickness=-1)
+        return masked
+
+    def run(
+        self,
+        image: MatLike,
+        conf: float = 0.6,
+        iou: float = 0.5,
+        run_time: float | None = None,
+        label_list: list[str] | None = None,
+        category_list: list[str] | None = None,
+    ) -> DetectFrameResult:
+        """
+        对图片进行识别；推理前先涂黑战斗头像区域
+        """
+        return Yolov8Detector.run(
+            self,
+            image=self.mask_battle_avatars(image),
+            conf=conf,
+            iou=iou,
+            run_time=run_time,
+            label_list=label_list,
+            category_list=category_list,
         )
 
     def is_frame_with_all(self, frame_result: DetectFrameResult | None = None) -> tuple[bool, bool, bool]:
@@ -117,7 +159,10 @@ def __debug():
     from zzz_od.context.zzz_context import ZContext
     ctx = ZContext()
     detector = LostVoidDetector(model_name=ctx.model_config.lost_void_det,
-                                backup_model_name=ctx.model_config.lost_void_det_backup)
+                                backup_model_name=ctx.model_config.lost_void_det_backup,
+                                model_download_url=ctx.model_config.get_model_download_base_url(
+                                    'lost_void_det',
+                                ))
 
     from one_dragon.utils import debug_utils
     screen = debug_utils.get_debug_image('_1736869628156')
@@ -129,7 +174,7 @@ def __debug():
     cv2_utils.show_image(result_image, win_name='lost_void_detector', wait=0)
     import cv2
     cv2.destroyAllWindows()
-    print(detector.is_frame_with(frame_result, '感叹号'))
+    print(detector.is_frame_with(frame_result, LostVoidDetector.CLASS_INTERACT))
 
 
 if __name__ == '__main__':

@@ -39,6 +39,7 @@ from one_dragon_qt.widgets.setting_card.password_switch_setting_card import (
     PasswordSwitchSettingCard,
 )
 from one_dragon_qt.widgets.setting_card.push_setting_card import PushSettingCard
+from one_dragon_qt.widgets.setting_card.switch_setting_card import SwitchSettingCard
 from one_dragon_qt.widgets.setting_card.text_setting_card import TextSettingCard
 from one_dragon_qt.widgets.vertical_scroll_interface import VerticalScrollInterface
 
@@ -114,7 +115,12 @@ class InstanceSettingCard(MultiPushSettingCard):
         self.login.emit(self.instance.idx)
 
     def _on_delete_clicked(self) -> None:
-        self.delete.emit(self.instance.idx)
+        dialog = Dialog(gt('警告'), gt('确定要删除吗'), self.parent())
+        dialog.setTitleBarVisible(False)
+        dialog.yesButton.setText(gt("确定"))
+        dialog.cancelButton.setText(gt("取消"))
+        if dialog.exec():
+            self.delete.emit(self.instance.idx)
 
     def check_active(self, active_idx: int) -> None:
         """
@@ -222,6 +228,11 @@ class SettingInstanceInterface(VerticalScrollInterface):
     def on_interface_shown(self) -> None:
         VerticalScrollInterface.on_interface_shown(self)
         self.init_game_account_config()
+        self._update_developer_visibility()
+
+    def _update_developer_visibility(self) -> None:
+        """仅在开发者模式下显示带密码实验功能。"""
+        self.custom_win_title_opt.setVisible(self.ctx.env_config.developer_mode)
 
     def _init_content_widget(self) -> None:
         """
@@ -247,6 +258,7 @@ class SettingInstanceInterface(VerticalScrollInterface):
         """
         self._init_content_widget()
         self.init_game_account_config()
+        self._update_developer_visibility()
 
     def init_game_account_config(self) -> None:
         # 初始化账号和密码
@@ -269,6 +281,7 @@ class SettingInstanceInterface(VerticalScrollInterface):
         self.bilibili_account_name.init_with_adapter(
             self.ctx.game_account_config.get_prop_adapter("bilibili_account_name")
         )
+        self.force_login_opt.setValue(self.ctx.one_dragon_config.current_instance_force_login, emit_signal=False)
 
         self.set_ui_of_game_region(self.ctx.game_account_config.game_region)
 
@@ -337,7 +350,7 @@ class SettingInstanceInterface(VerticalScrollInterface):
         instance_settings_group.addSettingCard(self.game_password_opt)
 
         self.help_bilibili_opt = HelpCard(title='B服使用提示',
-                                          content='B服请在『设置 - 脚本环境 - 基础』中设置截图方法为BitBit，否则可能无法识别登录框。')
+                                          content='B服在登录时会采用BitBlt的截图方法用于识别登录框，登录后还原。')
         instance_settings_group.addSettingCard(self.help_bilibili_opt)
 
         self.bilibili_account_name = TextSettingCard(
@@ -347,6 +360,14 @@ class SettingInstanceInterface(VerticalScrollInterface):
             input_placeholder="填写游戏中切换B服账号时显示的用户名",
         )
         instance_settings_group.addSettingCard(self.bilibili_account_name)
+
+        self.force_login_opt = SwitchSettingCard(
+            icon=FluentIcon.SYNC,
+            title="强制重新登录",
+            content="单账号运行且自动打开游戏时，开启后会使用当前账号配置重登，关闭时则直接使用游戏当前登录状态",
+        )
+        self.force_login_opt.value_changed.connect(self.ctx.one_dragon_config.set_current_instance_force_login)
+        instance_settings_group.addSettingCard(self.force_login_opt)
 
         # self.input_way_opt = ComboBoxSettingCard(icon=FluentIcon.CLIPPING_TOOL, title='输入方式',
         #                                          options_enum=TypeInputWay)

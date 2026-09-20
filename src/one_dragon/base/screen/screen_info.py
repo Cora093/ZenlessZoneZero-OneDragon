@@ -24,18 +24,26 @@ class ScreenInfo:
         for data_area in data_area_list:
             pc_rect = data_area.get('pc_rect')
             area = ScreenArea(
-                area_name=data_area.get('area_name'),
+                area_name=data_area.get('area_name', ''),
                 pc_rect=Rect(pc_rect[0], pc_rect[1], pc_rect[2], pc_rect[3]),
-                text=data_area.get('text'),
-                lcs_percent=data_area.get('lcs_percent'),
-                template_id=data_area.get('template_id'),
-                template_sub_dir=data_area.get('template_sub_dir'),
-                template_match_threshold=data_area.get('template_match_threshold'),
+                text=data_area.get('text', ''),
+                lcs_percent=(
+                    data_area.get('lcs_percent')
+                    if data_area.get('lcs_percent') is not None
+                    else 0.5
+                ),
+                template_id=data_area.get('template_id', ''),
+                template_sub_dir=data_area.get('template_sub_dir', ''),
+                template_match_threshold=(
+                    data_area.get('template_match_threshold')
+                    if data_area.get('template_match_threshold') is not None
+                    else 0.7
+                ),
                 color_range=data_area.get('color_range'),
                 pc_alt=self.pc_alt,
                 id_mark=data_area.get('id_mark', False),
                 goto_list=data_area.get('goto_list', []),
-                gamepad_key=data_area.get('gamepad_key', ''),
+                gamepad_key=data_area.get('gamepad_key', None),
             )
             self.area_list.append(area)
 
@@ -92,6 +100,37 @@ class ScreenInfo:
         if idx < 0 or idx >= length:
             return
         self.area_list.pop(idx)
+
+    def upsert_area(self, area: ScreenArea) -> str:
+        """按 area_name 插入或更新 area(存在则整体替换,否则追加)。
+
+        Args:
+            area: 要写入的区域;以 ``area_name`` 作为匹配键。
+
+        Returns:
+            ``'updated'`` 表示替换了既有同名 area;``'inserted'`` 表示新追加。
+        """
+        for idx, cur in enumerate(self.area_list):
+            if cur.area_name == area.area_name:
+                self.area_list[idx] = area
+                return 'updated'
+        self.area_list.append(area)
+        return 'inserted'
+
+    def remove_area_by_name(self, area_name: str) -> bool:
+        """按 area_name 删除 area。
+
+        Args:
+            area_name: 区域名(同 screen 内唯一)。
+
+        Returns:
+            找到并删除返 ``True``;不存在返 ``False``。
+        """
+        for idx, cur in enumerate(self.area_list):
+            if cur.area_name == area_name:
+                self.area_list.pop(idx)
+                return True
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {}

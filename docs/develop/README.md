@@ -4,19 +4,21 @@
 
 ## 文档索引
 
-- **开发环境与工具**：[开发环境](setup/environment.md) · [AI 编码助手接入](setup/ai_coding.md)
+- **开发环境与工具**：[快速开始](setup/quickstart.md) · [相关仓库](setup/repositories.md) · [AI 编码助手接入](setup/ai_coding.md)
 - **编码规范**：[agent_guidelines.md](spec/agent_guidelines.md)
-- **架构设计**：[一条龙整体架构](one_dragon/one_dragon_architecture.md) · [集成启动器 RuntimeLauncher](one_dragon/runtime_launcher.md) · [模块文档](one_dragon/modules/)
+- **开发流程**：[端到端开发流程](development_workflow.md)
+- **架构设计**：[一条龙整体架构](one_dragon/one_dragon_architecture.md) · [集成启动器 RuntimeLauncher](one_dragon/runtime_launcher.md) · [Git 服务与代码源回退](one_dragon/modules/git_service.md) · [资源下载源与候选回退](one_dragon/modules/resource_download.md) · [项目工作目录](one_dragon/modules/work_directory.md) · [模块文档](one_dragon/modules/)
 - **开发指引**：[应用插件开发](guides/application_plugin_guide.md) · [应用设置界面](guides/application_setting_guide.md)
-- **游戏业务**：[自动战斗](zzz/auto_battle.md) · [进游戏](zzz/enter_game.md) · [转向与灵敏度](zzz/turn_sensitivity.md) · [功能模块](zzz/application/) · [Web 架构](zzz/web/web-architecture.md)
+- **游戏业务**：[自动战斗](zzz/auto_battle.md) · [进游戏](zzz/enter_game.md) · [转向与灵敏度](zzz/turn_sensitivity.md) · [功能模块](zzz/application/) · [迷失之地](zzz/application/lost_void/) · [后端服务层](zzz/backend/) · [截图存档](zzz/screenshot_archive.md)
 - **AI Harness 工程**：[总览与路线图](harness/README.md)
 - **设计文档**：[屏幕区域识别设计](screen_scope_design.md) · [屏幕区域推进](screen_scope_rollout.md)
+- **测试与画面**：[测试方法论](testing/) · [截图存档](zzz/screenshot_archive.md)
 
 ## 1.开发
 
 ### 1.1.开发环境
 
-见 [setup/environment.md](setup/environment.md)。
+见 [setup/quickstart.md](setup/quickstart.md)（从零把项目跑起来）。
 
 ### 1.2.代码规范
 
@@ -46,6 +48,8 @@ Github Action 有完整的环境变量配置，会运行所有的测试用例。
 uv run --env-file .env pytest zzz-od-test/
 ```
 
+> 测试方法论(测试基建 / FixtureController 流程测试 / 画面截图存档)见 [testing/](testing/)。
+
 ### 常用业务文档
 
 - [转向与灵敏度配置](zzz/turn_sensitivity.md) - 说明 `turn_dx`、`gamepad_turn_speed`、前台/后台模式，以及锄大地、录像店营业、迷失之地、式舆防卫战各自的转向链路。
@@ -71,7 +75,7 @@ uv run --env-file .env pytest zzz-od-test/
 生成spec文件并打包
 
 ```shell
-uv run pyinstaller --onefile --windowed --uac-admin --icon="../assets/ui/installer_logo.ico" --add-data "../config/project.yml;config" ../src/zzz_od/gui/zzz_installer.py -n "OneDragon-Installer"
+uv run pyinstaller --onefile --windowed --uac-admin --icon="../assets/ui/installer_logo.ico" --add-data "../config/project.yml;config" --add-data "../config/repository.yml;config" ../src/zzz_od/gui/zzz_installer.py -n "OneDragon-Installer"
 ```
 
 使用spec打包
@@ -82,7 +86,7 @@ uv run pyinstaller --noconfirm --clean "OneDragon-Installer.spec"
 
 ### 3.2.启动器（原始）
 
-使用spec打包，会自动生成种子文件
+使用 spec 打包。`project.yml` 和 `repository.yml` 会随启动器写入 `resources/config`；原始启动器创建环境上下文时显式开启包内配置优先，其他入口仍读取仓库配置。
 
 ```shell
 uv run pyinstaller --noconfirm --clean "OneDragon-Launcher.spec"

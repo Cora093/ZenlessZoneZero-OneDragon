@@ -1,5 +1,4 @@
 import time
-from typing import ClassVar
 
 import cv2
 import numpy as np
@@ -7,25 +6,26 @@ from cv2.typing import MatLike
 
 from one_dragon.base.config.basic_game_config import TypeInputWay
 from one_dragon.base.config.game_account_config import GameRegionEnum
-from one_dragon.base.config.one_dragon_config import InstanceRun
 from one_dragon.base.controller.pc_clipboard import PcClipboard
 from one_dragon.base.geometry.point import Point
 from one_dragon.base.matcher.match_result import MatchResultList
 from one_dragon.base.matcher.ocr import ocr_utils
+from one_dragon.base.operation.operation_base import OperationResult
 from one_dragon.base.operation.operation_edge import node_from
 from one_dragon.base.operation.operation_node import operation_node
 from one_dragon.base.operation.operation_round_result import (
     OperationRoundResult,
-    OperationRoundResultEnum,
 )
+from one_dragon.envs.env_config import ScreenshotMethodEnum
 from one_dragon.utils import cv2_utils, str_utils
 from one_dragon.utils.i18_utils import gt
+from one_dragon.utils.log_utils import log
+from typing import ClassVar
 from zzz_od.context.zzz_context import ZContext
 from zzz_od.operation.zzz_operation import ZOperation
 
 
 class EnterGame(ZOperation):
-
     STATUS_GAME_DATA_UPDATED: ClassVar[str] = '游戏数据已更新'
     STATUS_LOGIN_SUCCESS: ClassVar[str] = '登录成功'
     STATUS_LOADING: ClassVar[str] = '加载中'
@@ -33,21 +33,22 @@ class EnterGame(ZOperation):
     MAX_RESOURCE_DOWNLOAD_SECONDS: ClassVar[float] = 1200
 
     def __init__(self, ctx: ZContext, switch: bool = False):
-        ZOperation.__init__(self, ctx, op_name=gt('进入游戏'))
+        ZOperation.__init__(self, ctx, op_name=gt('进入游戏'), op_callback=self.restore_screenshot_func)
 
         self.force_login: bool = (
-            self.ctx.one_dragon_config.instance_run == InstanceRun.ALL.value.value
-            and len(self.ctx.one_dragon_config.instance_list_in_od) > 1
+            self.ctx.one_dragon_config.current_instance_should_force_login
+            or self.ctx.one_dragon_config.current_instance_force_login
         )
 
         # 切换账号的情况下 一定需要登录
         if switch:
             self.force_login = True
 
-        # 未配置账号密码时，无法主动切换账号，依赖游戏保存的登录状态直接进入
+        # 未配置登录信息时，无法主动切换账号，依赖游戏保存的登录状态直接进入
         # switch=True 时前置流程已执行游戏内登出，不能跳过 force_login
         cfg = self.ctx.game_account_config
-        if not switch and not cfg.account and not cfg.password and not cfg.bilibili_account_name:
+        if not switch and self.force_login and not cfg.has_login_info:
+            log.warning('登录信息未配置完整，跳过强制重新登录，将使用游戏当前登录状态')
             self.force_login = False
 
         self.already_login: bool = False  # 是否已经提交账号登录
@@ -58,6 +59,8 @@ class EnterGame(ZOperation):
 
         self.interact_ignore_word_list: list[str] = []  # 进入游戏时 交互需要忽略的文本
 
+        self.screenshot_func: str = self.ctx.controller.screenshot_method
+
     def handle_init(self):
         # 本OP会被复用 多次登录时重置这个记录
         self.already_login = False
@@ -65,6 +68,11 @@ class EnterGame(ZOperation):
         self.after_second_enter_click = False
         self.resource_download_start_time = None
         self.interact_ignore_word_list.clear()
+
+        # B服登录时采用BitBlt截图
+        if self.ctx.game_account_config.game_region == GameRegionEnum.CNB.value.value:
+            log.info('检测到B服登录, 使用Bitblt截图方式')
+            self.ctx.controller.screenshot_controller.init_screenshot(ScreenshotMethodEnum.BITBLT.value.value)
 
     @node_from(from_name='国服-输入账号密码')
     @node_from(from_name='国服-输入账号密码-新')
@@ -410,6 +418,11 @@ class EnterGame(ZOperation):
         :param screen: 游戏画面
         :return: 是否有相关操作 有的话返回对应操作结果
         """
+        for area_name in ('二周年自选奖励', '一周年自选奖励'):
+            result = self.round_by_find_and_click_area(screen, '打开游戏', area_name)
+            if result.is_success:
+                return self.round_wait(status=result.status, wait=1)
+
         ocr_result_map = self.ctx.ocr.run_ocr(screen)
         back_btn_result = self.round_by_find_area(screen, '菜单', '返回')
 
@@ -438,6 +451,7 @@ class EnterGame(ZOperation):
             '待领取',  # 需要有这个词 防止画面出现"待领取"也匹配到"领取"
             '今日到账',  # 小月卡 issue #893
             '惊喜补给',  # 免费月卡 issue #1996
+            '继续连接',  # 登录的时候网卡了一下
         ]
         ignore_list: list[str] = [
             '已领取',  # 需要有这个词 防止画面出现"已领取"也匹配到"领取"
@@ -467,7 +481,7 @@ class EnterGame(ZOperation):
             if match_word.find('领取') != -1:
                 self.interact_ignore_word_list.append(match_word)
 
-            time.sleep(0.5) # 等待画面稳定
+            time.sleep(0.5)  # 等待画面稳定
             self.ctx.controller.click(match_word_mrl.max.center)
             return self.round_wait(status=match_word, wait=1)
 
@@ -496,7 +510,7 @@ class EnterGame(ZOperation):
             target_word_list
         )
         if match_word is not None and match_word_mrl is not None and match_word_mrl.max is not None:
-            time.sleep(0.5) # 等待画面稳定
+            time.sleep(0.5)  # 等待画面稳定
             self.ctx.controller.click(match_word_mrl.max.center)
             return self.round_wait(status=match_word, wait=1)
 
@@ -554,7 +568,7 @@ class EnterGame(ZOperation):
 
         downloading_seconds = now - self.resource_download_start_time
         if downloading_seconds < EnterGame.MAX_RESOURCE_DOWNLOAD_SECONDS:
-            return OperationRoundResult(result=OperationRoundResultEnum.WAIT, status='资源下载中')
+            return self.round_wait('资源下载中', wait=2)
 
         self.resource_download_start_time = None
         return self.round_fail('资源下载超时')
@@ -585,6 +599,7 @@ class EnterGame(ZOperation):
         )
         target_word_list: list[str] = [
             '加载配置数据中',
+            '版本校对中',
             '登录游戏服务器中',
             EnterGame.STATUS_LOGIN_SUCCESS,
             '资源下载中',
@@ -643,7 +658,7 @@ class EnterGame(ZOperation):
                         self.after_second_enter_click = True
                     else:
                         self.after_first_enter_click = True
-                    return self.round_wait(status=match_word, wait=1)
+                    return self.round_wait(status=match_word, wait=2)
                 return click_result
 
             if match_word == '加载配置数据中':
@@ -669,7 +684,7 @@ class EnterGame(ZOperation):
 
     @node_from(from_name='点击进入游戏', status=STATUS_LOGIN_SUCCESS)
     @node_from(from_name='点击进入游戏', status=STATUS_LOADING)
-    @operation_node(name='登录成功', timeout_seconds=MAX_LOADING_SECONDS)
+    @operation_node(name='登录成功', timeout_seconds=MAX_LOADING_SECONDS, node_max_retry_times=9999)
     def wait_loading(self) -> OperationRoundResult:
         """
         等待加载场景结束，并处理加载后的弹窗和大世界识别。
@@ -700,6 +715,13 @@ class EnterGame(ZOperation):
             return return_result
 
         return self.round_retry('登录成功后等待加载中或大世界', wait=2)
+
+    # B服登录后恢复原有截图方法
+    # noinspection PyUnusedLocal
+    def restore_screenshot_func(self, result: OperationResult) -> None:
+        if self.ctx.game_account_config.game_region == GameRegionEnum.CNB.value.value:
+            log.info('B服登录结束, 恢复原来的截图方式: ' + self.screenshot_func)
+            self.ctx.controller.screenshot_controller.init_screenshot(self.screenshot_func)
 
 
 def __debug():

@@ -53,7 +53,7 @@ def print_message(message: str, level: str = "INFO", flush: bool = False) -> Non
 
 def create_git_progress_callback():
     def _report(_progress: float, message: str) -> None:
-        refresh = message.startswith(gt('拉取对象')) and not message.endswith('(100%)')
+        refresh = '%' in message and 'done' not in message.lower()
         print_message(message, 'INFO', flush=refresh)
 
     return _report
@@ -76,13 +76,15 @@ def _configure_runtime_logger() -> None:
         ),
     )
 
-def verify_working_directory():
-    # 设置当前工作目录
-    if getattr(sys, 'frozen', False):
-        cwd = os.path.dirname(sys.executable)
+def verify_working_directory() -> str:
+    """切换并校验启动器工作目录。
 
-    # 如果目录为空，使用当前工作目录
-    if not cwd:
+    Returns:
+        启动器使用的工作目录。
+    """
+    if getattr(sys, 'frozen', False):
+        cwd = str(Path(sys.executable).resolve().parent)
+    else:
         cwd = os.getcwd()
 
     os.chdir(cwd)
@@ -274,10 +276,10 @@ def execute_python_script(
         full_command = " ".join(powershell_command)
         # 使用 subprocess.Popen 启动新的 PowerShell 窗口并执行命令
         subprocess.Popen(
-            ["powershell", "-Command", full_command],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", full_command],
             creationflags=subprocess.CREATE_NO_WINDOW if no_windows else 0
         )
-        print_message("一条龙 正在启动中，大约 3+ 秒...", "INFO")
+        print_message("等待主界面弹出...", "INFO")
 
 def fetch_latest_code(ctx: OneDragonEnvContext) -> None:
     """
@@ -287,12 +289,40 @@ def fetch_latest_code(ctx: OneDragonEnvContext) -> None:
         print_message(gt('未开启代码自动更新，跳过'), "INFO")
         return
     _configure_runtime_logger()
+    from one_dragon.envs.git_service import GitSyncStatus
+
     progress_callback = create_git_progress_callback()
-    success, msg = ctx.git_service.fetch_latest_code(progress_callback=progress_callback)
-    if success:
-        print_message(gt('代码更新完成'), "PASS")
+    status, message = ctx.git_service.fetch_latest_code(progress_callback=progress_callback)
+    if status in (GitSyncStatus.SUCCESS, GitSyncStatus.UP_TO_DATE):
+        level = 'PASS'
+    elif status is GitSyncStatus.RUNTIME_INCOMPATIBLE:
+        message = f'{message}, {gt("继续使用当前版本")}'
+        level = 'WARNING'
+    elif status is GitSyncStatus.BUILTIN_TAG_UNAVAILABLE:
+        message = f'{message}, {gt("继续使用内置版本")}'
+        level = 'WARNING'
+    elif status in (GitSyncStatus.REMOTE_UNAVAILABLE, GitSyncStatus.LOCAL_CHANGES):
+        message = f'{message}, {gt("继续使用当前版本")}'
+        level = 'WARNING'
+    elif status is GitSyncStatus.LOCAL_UPDATE_FAILED:
+        message = f'{message}, {gt("请重新运行启动器；仍然失败时请重新安装")}'
+        level = 'ERROR'
     else:
-        print_message(f"{gt('代码更新失败')}: {msg}", "ERROR")
+        message = f'{message}, {gt("请查看日志后重试")}'
+        level = 'ERROR'
+    print_message(message, level)
+
+
+def sync_dependencies(ctx: OneDragonEnvContext) -> None:
+    """按需同步运行依赖。"""
+    print_message("开始检查运行环境...", "INFO")
+    success, msg = ctx.python_service.uv_sync_runtime_dependencies()
+    print_message(msg, "PASS" if success else "ERROR")
+    if not success:
+        with contextlib.suppress(EOFError):
+            input("请重新启动程序；若问题仍然存在，请下载最新安装器重新配置运行环境。按回车键退出...")
+        sys.exit(1)
+
 
 def run_python(app_path, no_windows: bool = True, args: list[str] | None = None, piped: bool = False) -> None:
     # 主函数
@@ -301,13 +331,15 @@ def run_python(app_path, no_windows: bool = True, args: list[str] | None = None,
         print_message(f"OneDragon 启动器 {__version__}", "INFO")
         cwd = verify_working_directory()
         from one_dragon.base.operation.one_dragon_env_context import OneDragonEnvContext
-        ctx = OneDragonEnvContext()
+        ctx = OneDragonEnvContext(prefer_bundled_config=True)
         configure_environment(ctx, cwd)
         fetch_latest_code(ctx)
+        sync_dependencies(ctx)
         execute_python_script(ctx, app_path, no_windows, args, piped)
     except SystemExit as e:
         print_message(f"程序已退出，状态码：{e.code}", "ERROR")
+        raise
     except Exception as e:
         print_message(f"出现未处理的异常：{e}", "ERROR")
     finally:
-        time.sleep(3)
+        time.sleep(5)

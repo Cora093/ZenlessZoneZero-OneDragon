@@ -62,11 +62,98 @@ New-Item -ItemType HardLink -Path "CLAUDE.md" -Target "AGENTS.md"
 ## MCP
 
 - **推荐**：[context7](https://github.com/upstash/context7) — 查询库文档；已在本项目 `.claude/settings.json` 启用（Claude Code 场景）。
-- **项目自有 MCP（规划中）**：后续将把游戏操作（截图 / OCR / 进游戏等）暴露给 agent，用于辅助开发与调试。整体设计见 [harness/README.md](../harness/README.md)。
+- **项目自有 MCP（感知/操作 tool 已实现）**：把游戏感知/操作（窗口状态 / 截图 / OCR / 进游戏 + 运行态查/停）经 MCP 暴露给 agent，辅助开发与调试。传输 streamable-http（端点 `/mcp`，默认端口 23001）。先起服务（`uv run --env-file .env python -m zzz_od.backend.entry.server`），再 `claude mcp add --transport http zzz_od http://127.0.0.1:23001/mcp`。**工具清单见 [zzz/backend/mcp.md](../zzz/backend/mcp.md)**（不在此列举，避免随实现演进过时）；整体设计见 [zzz/backend/](../zzz/backend/)，路线图见 [harness/README.md](../harness/README.md)。
+- **浏览器（chrome-devtools-mcp）**：让 agent 经 CDP 驱动本机浏览器，读/操作 WebSearch 搜不到或抓不到的页面（米游社攻略、需登录活动页等）。connect 模式 + 调试 Edge，装法与会话坑见 [chrome-devtools-mcp.md](chrome-devtools-mcp.md)。
+
+## 测试仓
+
+测试代码在独立仓 `zzz-od-test/`(`.gitignore`,clone 到项目根目录),不在主仓。Claude Code 的 Grep/Glob 默认尊重 `.gitignore`,**不会自动搜** `zzz-od-test/`——查/改测试须 `Read`/`grep` 显式指定 `zzz-od-test/` 路径。clone 指引见 [quickstart §②](quickstart.md#②-跑测试可选),规范见 [spec/agent_guidelines.md](../spec/agent_guidelines.md#测试代码规范)。
+
+## LSP
+
+项目用 **uv 方式 pyright** 做 LSP(代码导航:定义 / 引用 / 符号)——不用 Claude Code 官方的全局 pyright(走系统 PATH,解析不到项目 `.venv` 依赖,跟 uv 环境冲突)。pyright 在 dev 组、`[tool.pyright]` 配置(团队共享);Claude Code 的插件安装见 [claude-code/pyright-lsp.md](claude-code/pyright-lsp.md)。
 
 ## Skills
 
-现有 Claude Code skill 在仓库根 `skills/`（如 `agent-auto-battle-config`、`agent-definition`、`new-config`）。后续约定与清单见 [harness/README.md](../harness/README.md)（待实施）。
+Skill 是 Claude Code（及 Codex 等少数工具）的可调用能力。要点：**每个工具只读自己目录下的 skill**——Claude Code 读 `.claude/skills/`，**不读根目录 `skills/`**；且 skill 没有 `@import` 之类的引入逃逸口。
+
+### 推荐安装 superpowers
+
+**项目已统一采用 [superpowers](https://github.com/anthropics/superpowers)**（团队共识）—— 它是一整套**开发流程方法论**，指导从需求探索（`brainstorming`）、写计划（`writing-plans`）、TDD 实现（`test-driven-development`）、调试（`systematic-debugging`）、code review、到分支收尾合并（`finishing-a-development-branch`）的全链路；本项目按这套流程开发。
+
+本项目 dev skill（`zzz-od-dev-*`）是叠加在 superpowers 之上的**项目特定补充**（PR 收尾适配 CodeRabbit、本项目 skill 写作硬规范、修复决策框架等），非替代 —— 使用者需同时具备 superpowers。Claude Code 安装：插件市场搜 `superpowers`，或 `/plugin install superpowers`。
+
+### 推荐安装 mcp-server-dev（写 MCP tool 时）
+
+写本项目 backend MCP tool（`src/zzz_od/backend/mcp/`）时，**通用 MCP tool 设计方法论遵循 Anthropic 官方 `mcp-server-dev` plugin**（`claude-plugins-official` marketplace，专门 MCP 开发、3 个 skill 无杂烩）—— 尤其 `build-mcp-server/references/tool-design.md`（写好 tool：description 契约 / tight schema / annotations / 结构化返回 / actionable error / 读写分离 / token 经济）。本项目 [mcp-implementation.md](../zzz/backend/mcp-implementation.md) 只叠加**项目特化**（哪些 tool 标哪个 hint、MCP·HTTP 对称、screen_info CRUD、操作后 sleep 等），不重复通用知识。
+
+Claude Code 安装（`claude-plugins-official` marketplace，两步）：
+
+```
+/plugin marketplace add anthropics/claude-plugins-official
+/plugin install mcp-server-dev@claude-plugins-official   # 3 个 MCP skill(build-mcp-server/app/mcpb)，专门 MCP 无杂烩
+```
+
+### Skill 分类与命名
+
+Skill 分两类，统一用 `zzz-od-` 项目前缀，开发类再加 `dev-`：
+
+| 类别 | 前缀 | 用途 |
+|---|---|---|
+| **开发** | `zzz-od-dev-` | 指引 AI 在本项目开发/配置/构建（superpowers 风格） |
+| **历史遗留** | 无前缀 | 早期 skill，暂保留原名（迁移价值待评估） |
+
+> 现有 skill 清单见 [`skills/` 目录](../../../skills/)（每个 SKILL.md frontmatter 有触发描述），不在此罗列以免随增减过时。
+>
+> `zzz-od-` 兼作**项目命名空间**——避免和插件/个人 skill 撞名，`/` 列表里本项目 skill 聚一起。命名示例：`zzz-od-dev-character`（新增角色）、`zzz-od-dev-build`（构建配置）、`zzz-od-player`（安装使用）。将来若出现第 3 类（如调试），加对应中缀（`zzz-od-debug-*`）即可。
+
+### Skill 开发：三级晋升
+
+跟整体"三级晋升"一致，新增 skill 从低到高放：
+
+| 级别 | 位置 | 是否提交 | 说明 |
+|---|---|:---:|---|
+| **① 个人级** | `.claude/skills/<name>/`（`.claude/*` 已 gitignore，天然不提交）或 `~/.claude/skills/` | ❌ | 先在这里试做、验证有用再升级。 |
+| **② 工具项目级** | `.claude/skills/<name>/`（**提交**：`.gitignore` 放行 `.claude/skills/`） | ✅ | 团队共享、Claude Code 特有。 |
+| **③ 项目级（跨工具源）** | 根目录 `skills/<name>/`（**提交**） | ✅ | 多个"skills 感知"工具都要用时，作单一源。 |
+
+**晋升路径**：① 个人试做 →（验证有用）→ ② 提交到 `.claude/skills/` →（多工具都要）→ ③ 根 `skills/` 作跨工具源。
+
+> ⚠️ 根 `skills/` 不会被工具自动发现，只是③的单一源；要**目录联接**（junction，`mklink /J`，目录级）进各工具目录（如 `.claude/skills/`）。Windows junction 免管理员（symlink 需特权/开发者模式）。只有 Claude Code 一个消费者时，停在②即可，不必上③。
+
+### 现状
+
+仓库根 [`skills/`](../../../skills/) 是 skill 的单一源（③）；开发类（`zzz-od-dev-*`，superpowers 风格）经 junction（`.claude/skills/<name>` → 根 `skills/<name>`）被 Claude Code 自动加载。**现有 skill 清单见目录本身**（每个 SKILL.md frontmatter 有触发描述），不在此罗列以免随增减过时。
+
+新 skill 按上面的命名规范用 `zzz-od-` 前缀。
+
+## AI 辅助提交的署名（推荐）
+
+用 AI 编码工具协作时，**推荐在 commit 消息里用 `Co-Authored-By` trailer 标明 AI 参与**——让提交历史能看出哪些是 AI 协作的（透明、可追溯），GitHub 会识别该格式并把 co-author 显示在提交上。
+
+```
+Co-Authored-By: <名字> <邮箱>
+```
+
+落地有两种做法，按“靠模型自觉 → 全自动”递进：
+
+### 做法一：在指令文件里写指引
+
+在该 AI 工具的指令文件里写一条，让它自己加 trailer（例如“提交时在 message 末尾追加 `Co-Authored-By: <工具> (<模型>) <邮箱>`”）。
+
+- ✅ 零配置、跨工具。
+- ❌ **靠模型自觉**：会忘、会漏，模型名也可能写错。
+
+### 做法二：用 git hook 自动注入（推荐）
+
+用 git 的 `prepare-commit-msg` 钩子在每次提交时自动追加 trailer，不依赖模型记忆。git 每次提交都会调它，链式 `&&`、`git -C <dir>`、`--amend` 全覆盖。两种粒度：
+
+- **2a. 钩子里写死内容（静态）**：硬编码固定 trailer。最简单、稳；但不反映实际模型。
+- **2b. git hook + AI 工具 hook 写入模型名（动态）**：git 钩子注入 trailer；再用 AI 工具自带的 hook 在每次 `git commit` 前把**当前模型名**写到侧信道文件，git 钩子读取 → trailer 反映实际模型，模型一换跟着变。需把工具默认的 co-author 指令关掉，避免重复。
+
+各工具的具体实现不同——Claude Code 的做法见 [Claude Code：自动注入 commit trailer](claude-code/commit-trailer.md)；其他工具用各自等价的 hook 机制。
+
+> 注：部分工具/模型厂商没有官方 GitHub bot 邮箱，模型那行的邮箱只是占位（GitHub 上不出头像/contributor）；推荐用对应厂商**官网域名**（如 `noreply@<官网域名>`）作占位。
 
 ## 相关文档
 

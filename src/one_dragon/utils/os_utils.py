@@ -2,6 +2,9 @@ import datetime
 import os
 import sys
 from functools import lru_cache
+from pathlib import Path
+
+_work_dir: Path | None = None
 
 
 def join_dir_path_with_mk(path: str, *subs) -> str:
@@ -31,18 +34,29 @@ def get_path_under_work_dir(*sub_paths: str) -> str:
     return join_dir_path_with_mk(get_work_dir(), *sub_paths)
 
 
-def get_resource_path(*sub_paths: str) -> str:
+def get_resource_path(
+        *sub_paths: str,
+        prefer_bundled: bool = False,
+) -> str:
     """获取资源文件路径。
 
-    优先查找工作目录下的路径，不存在时回退到 PyInstaller _MEIPASS。
+    默认优先查找工作目录下的路径，不存在时回退到 PyInstaller _MEIPASS。
+    ``prefer_bundled`` 开启时交换两者的优先级。
     """
     work_path = os.path.join(get_work_dir(), *sub_paths)
+    runtime_dir = getattr(sys, '_MEIPASS', None)
+    bundled_path = (
+        os.path.join(runtime_dir, 'resources', *sub_paths)
+        if runtime_dir is not None
+        else None
+    )
+
+    if prefer_bundled and bundled_path is not None and os.path.exists(bundled_path):
+        return bundled_path
     if os.path.exists(work_path):
         return work_path
-    if hasattr(sys, '_MEIPASS'):
-        mei_path = os.path.join(sys._MEIPASS, 'resources', *sub_paths)
-        if os.path.exists(mei_path):
-            return mei_path
+    if bundled_path is not None and os.path.exists(bundled_path):
+        return bundled_path
     return work_path
 
 
@@ -55,19 +69,30 @@ def run_in_exe() -> bool:
     return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
 
 
-@lru_cache
+def set_work_dir(work_dir: str | Path | None) -> None:
+    """显式设置项目工作目录。
+
+    Args:
+        work_dir: 项目工作目录。传入 ``None`` 时恢复默认目录判定。
+    """
+    global _work_dir
+    _work_dir = None if work_dir is None else Path(work_dir).resolve()
+
+
 def get_work_dir() -> str:
+    """返回稳定的项目工作目录。
+
+    显式设置的目录优先；冻结运行时默认使用可执行文件所在目录，
+    源码运行时根据当前文件位置推导项目根目录。
+
+    Returns:
+        项目工作目录。
     """
-    返回项目根目录的路径
-    :return: 项目根目录
-    """
+    if _work_dir is not None:
+        return str(_work_dir)
     if run_in_exe():
-        return os.getcwd()
-    dir_path: str = os.path.abspath(__file__)
-    up_times = 4
-    for _ in range(up_times):
-        dir_path = os.path.dirname(dir_path)
-    return dir_path
+        return str(Path(sys.executable).resolve().parent)
+    return str(Path(__file__).resolve().parents[3])
 
 
 def get_env(key: str) -> str | None:

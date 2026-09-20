@@ -3,7 +3,8 @@ build/
 dist/
 zzz-od-test/
 .idea/
-.vscode/
+.vscode/*
+!.vscode/launch.json
 __pycache__/
 deploy/build/
 deploy/dist/
@@ -15,8 +16,14 @@ CLAUDE.local.md
 .lingma/
 .qwen/
 .claude/*
+.pai/
 !.claude/CLAUDE.md
 nul
+.kiro/
+
+# superpowers
+docs/superpowers/
+.superpowers/
 
 # 用户独有的配置文件
 env.bat

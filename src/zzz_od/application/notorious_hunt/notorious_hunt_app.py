@@ -23,6 +23,8 @@ from zzz_od.operation.compendium.tp_by_compendium import TransportByCompendium
 
 class NotoriousHuntApp(ZApplication):
 
+    """恶名狩猎:按计划打周限高难狩猎本(每周按周历轮换)。每周 3 次免费奖励(不耗电量)、进入战斗。"""
+
     STATUS_NO_PLAN: ClassVar[str] = '未配置恶名狩猎计划'
     STATUS_ROUND_FINISHED: ClassVar[str] = '本轮计划已完成'
 
@@ -85,6 +87,12 @@ class NotoriousHuntApp(ZApplication):
         return self.round_success()
 
     @node_from(from_name='查找下一条计划')
+    @operation_node(name='前往大世界')  # 特训目标查找失败可能把快捷手册列表滑到底部，返回大世界后重置列表位置
+    def back_before_open_compendium(self) -> OperationRoundResult:
+        op = BackToNormalWorld(self.ctx, ensure_normal_world=True)
+        return self.round_by_op_result(op.execute())
+
+    @node_from(from_name='前往大世界')
     @operation_node(name='传送')
     def transport(self) -> OperationRoundResult:
         op = TransportByCompendium(self.ctx,
