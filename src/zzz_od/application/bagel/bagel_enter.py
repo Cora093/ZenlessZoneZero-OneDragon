@@ -36,12 +36,19 @@ class BagelEnter(BagelOperation):
 
     def __init__(
         self, ctx: ZContext, *, allow_clear_loadout: bool = False,
-        allow_world_recovery: bool = False,
+        allow_world_recovery: bool = False, reuse_selection: bool = False,
     ) -> None:
-        """仅应用首次入场显式允许清空；独立工具默认只核对零携带。"""
+        """仅应用首次入场显式允许清空；独立工具默认只核对零携带。
+
+        `reuse_selection` 为真表示本次任务的上一局已经核对过雅努斯高危，地图和难度
+        默认仍是这一组，可跳过点击直接进备战；进页后仍会核对一次，状态不符则退回
+        逐项点击。
+        """
         super().__init__(ctx, op_name='贝果-零携带入场', timeout_seconds=660 if allow_clear_loadout else 240)
         self.allow_clear_loadout: bool = allow_clear_loadout
         self.allow_world_recovery: bool = allow_world_recovery
+        self.reuse_selection: bool = reuse_selection
+        self.selection_reused: bool = False
         self.world_recovery_attempted: bool = False
         self.clear_attempted: bool = False
         self.loadout_misses: int = 0
@@ -224,15 +231,23 @@ class BagelEnter(BagelOperation):
 
     @node_from(from_name='备战返回选图')
     @node_from(from_name='打开贝果选图')
+    @node_from(from_name='重选雅努斯高危')
     @operation_node(name='选择雅努斯', timeout_seconds=15)
     def choose_map(self) -> OperationRoundResult:
-        """点击左侧地图卡后核对右侧实际选中地图。"""
+        """连续执行时默认仍是雅努斯高危，页签不符再退回逐项点击。"""
+        if self.reuse_selection and not self.selection_reused:
+            if self.round_by_find_area(self.last_screenshot, '贝果-选图', '前往备战').is_success:
+                self.selection_reused = True
+                return self.round_success('沿用上一局地图与难度')
+            self.reuse_selection = False
+            self.selection_reused = False
         return self.round_by_find_and_click_area(
             self.last_screenshot, '贝果-选图', '雅努斯',
             until_find_all=[('贝果-选图', '选中地图')], success_wait=1, retry_wait=1,
         )
 
     @node_from(from_name='选择雅努斯')
+    @node_from(from_name='重选雅努斯高危')
     @operation_node(name='选择高危', timeout_seconds=15)
     def choose_difficulty(self) -> OperationRoundResult:
         """选中后用对应推荐价值与地图名复核，不能只检测页签文字存在。"""
@@ -245,7 +260,9 @@ class BagelEnter(BagelOperation):
             return self.round_wait('等待高危选择生效', wait=1)
         return result
 
+    @node_from(from_name='选择雅努斯', status='沿用上一局地图与难度')
     @node_from(from_name='选择高危')
+    @node_from(from_name='重选雅努斯高危')
     @operation_node(name='打开备战', timeout_seconds=20)
     def open_prepare(self) -> OperationRoundResult:
         """地图和难度确认之后才打开备战。"""
@@ -255,6 +272,12 @@ class BagelEnter(BagelOperation):
             self.last_screenshot, '贝果-选图', '前往备战',
             until_find_all=[('贝果-备战', '预设组合')], success_wait=1, retry_wait=1,
         )
+
+    @node_from(from_name='打开备战', success=False)
+    @operation_node(name='重选雅努斯高危', timeout_seconds=20)
+    def reselect_map(self) -> OperationRoundResult:
+        """沿用选择后没能进备战，说明页签不符，改回逐项点击。"""
+        return self.round_wait('沿用选择未能进入备战，重新选地图与难度', wait=0.5)
 
     @node_from(from_name='打开备战')
     @node_from(from_name='清空启动战备')

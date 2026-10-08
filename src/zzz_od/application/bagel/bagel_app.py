@@ -176,6 +176,7 @@ class BagelApp(ZApplication):
         log.info('贝果收集：准备第 %s 次入场', self.attempts + 1)
         result = BagelEnter(
             self.ctx, allow_clear_loadout=allow_clear_loadout, allow_world_recovery=True,
+            reuse_selection=self.success_rounds > 0,
         ).execute()
         if retrying_failure and not result.success:
             return self._finish_failed_round(result, '额外入场')
