@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class BagelSettleWarehouse(BagelOperation):
-    """入仓后按开关清理；仓满且安全箱有物时保留现场。"""
+    """入仓后按开关清理；仓满且安全箱有物时无视开关强制腾位。"""
 
     STATUS_DONE: str = BagelDeposit.STATUS_DONE
 
@@ -29,22 +29,34 @@ class BagelSettleWarehouse(BagelOperation):
         self.auto_clean: bool = auto_clean
         self.filter_areas: tuple[str, ...] = filter_areas
         self.deposit_status: str = BagelDeposit.STATUS_EMPTY
+        self.forced_clean: bool = False
 
     @operation_node(name='首次入仓', is_start_node=True, screenshot_before_round=False)
     def deposit_first(self) -> OperationRoundResult:
-        """先尝试入仓；满了且仍有物资则停止。"""
+        """先尝试入仓；满了且仍有物资则强制腾位。"""
         result = BagelDeposit(self.ctx).execute()
         if not result.success:
             return self.round_by_op_result(result)
         if result.status == BagelDeposit.STATUS_FULL:
-            return self.round_fail('仓库已满且安全箱仍有物资，禁止批量出售，停止并保留现场')
+            # 仓库放不下了。安全箱里还有物资腾不出去，下一局拿到的会溢出丢失，
+            # 因此这一局无视清理开关，先卖掉腾位再结束。
+            self.forced_clean = True
+            result = BagelCleanWarehouse(self.ctx, self.filter_areas).execute()
+            if not result.success:
+                return self.round_by_op_result(result)
+            log.info('贝果仓库已满，强制清理腾位：%s', result.status)
+            self.deposit_status = BagelDeposit.STATUS_DONE
+            return self.round_success('仓库已满，清理腾位完成')
         self.deposit_status = result.status
         return self.round_success('已入仓')
 
     @node_from(from_name='首次入仓', status='已入仓')
+    @node_from(from_name='首次入仓', status='仓库已满，清理腾位完成')
     @operation_node(name='入仓后清理', screenshot_before_round=False)
     def clean_after_deposit(self) -> OperationRoundResult:
-        """开关关闭则跳过出售。"""
+        """开关关闭则跳过出售；仓满那一局已在入仓节点清理过。"""
+        if self.forced_clean:
+            return self.round_success(self.deposit_status)
         if not self.auto_clean:
             return self.round_success(self.deposit_status)
         result = BagelCleanWarehouse(self.ctx, self.filter_areas).execute()
