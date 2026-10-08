@@ -335,6 +335,16 @@ class BagelEnter(BagelOperation):
                 self.investment_confirmed = True
                 return self.round_wait('等待零投资入场', wait=1)
             return result
+        if self.confirmed_warnings:
+            # 已确认过第一个弹窗，后续弹窗不再读提示文字：只按确认按钮是否还在推进。
+            # 省掉每帧一次 OCR；点击前等待也压到最小，弹窗之间本来就挨得很近。
+            if self.round_by_find_area(self.last_screenshot, '贝果-入场确认', '确认').is_success:
+                return self.round_by_find_and_click_area(
+                    self.last_screenshot, '贝果-入场确认', '确认',
+                    pre_delay=0.15,
+                    until_not_find_all=[('贝果-入场确认', '确认')], success_wait=0.3, retry_wait=0.3,
+                )
+            return self.round_wait('等待零投资入场或贝果加载完成', wait=0.5)
         text = read_area(self.ctx, self.last_screenshot, '贝果-入场确认', '提示')
         warning = entry_warning(text)
         if warning is not None:
@@ -343,7 +353,8 @@ class BagelEnter(BagelOperation):
             result = self.round_by_find_and_click_area(self.last_screenshot, '贝果-入场确认', '确认')
             if result.is_success:
                 self.confirmed_warnings.add(warning)
-                return self.round_wait(warning, wait=1)
+                # 三个零携带弹窗连着出现，识别到第一个后按按钮是否还在推进，不再逐个 OCR。
+                return self.round_wait(f'{warning}，连续确认后续弹窗', wait=0.4)
             return result
         if text and self.round_by_find_area(self.last_screenshot, '贝果-入场确认', '确认').is_success:
             return self.round_fail('未知入场确认，停止并保留现场')
