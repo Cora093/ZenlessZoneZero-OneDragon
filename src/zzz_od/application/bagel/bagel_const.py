@@ -28,6 +28,13 @@ NAV_FORWARD_PRESS: float = 0.2
 NAV_ALIGN_PRESS: float = 0.08
 NAV_SAFE_APPROACH_PRESS: float = 0.08
 
+# 「原地开始」模式：先读小地图，认得出支持出生点就直接进该路线流程，不重开。
+START_IN_PLACE_HUD_MISS_LIMIT: int = 4
+START_IN_PLACE_HUD_WAIT: float = 0.3
+# 认出的位置离出生点多远仍算「在出生点附近」。超出说明已经走远了，
+# 直接按该路线跑会从错误位置起步，不如照常重开。
+START_IN_PLACE_SPAWN_RADIUS: float = 12.0
+
 # （实测 0.22~0.93）。
 SPAWN_STABLE_MAX_DIFF: float = 1.0
 # 需要连续多少帧都低于门槛才判定画面已收敛。加载卡顿时入场过渡期可能恰好停一两帧
