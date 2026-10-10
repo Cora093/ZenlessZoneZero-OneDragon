@@ -9,9 +9,10 @@ from typing import Any
 
 from one_dragon.utils import os_utils
 
-SUPPORTED_MAP_IDS: tuple[str, ...] = ('janus_high_a', 'janus_high_b')
+SUPPORTED_MAP_IDS: tuple[str, ...] = ('janus_high_a', 'janus_high_b', 'janus_high_c')
 MAP_LABELS: dict[str, str] = {
     'janus_high_a': 'A · 录像店', 'janus_high_b': 'B · 白鸽工地地铁站',
+    'janus_high_c': 'C · 单廊双容器',
 }
 ROLE_LABELS: dict[str, str] = {
     'turn': '转折', 'entry': '保险箱入口', 'approach': '接近', 'target': '交互目标',
