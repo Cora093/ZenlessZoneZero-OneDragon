@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import hypot
 from typing import TYPE_CHECKING
 
 import cv2
@@ -29,6 +30,8 @@ from zzz_od.application.bagel.bagel_slots import safe_occupied_indices
 from zzz_od.application.zzz_application import ZApplication
 
 if TYPE_CHECKING:
+    from one_dragon.utils.typem import MatLike
+
     from one_dragon.base.operation.operation_base import OperationResult
     from one_dragon.base.operation.operation_round_result import OperationRoundResult
     from zzz_od.application.bagel.bagel_config import BagelConfig
@@ -74,6 +77,9 @@ class BagelApp(ZApplication):
         self.failure_reason: str | None = None
         self.failure_history: list[dict[str, object]] = []
         self._spawn_hud_misses: int = 0
+        self._spawn_dim_misses: int = 0
+        self._spawn_prev_signature: MatLike | None = None
+        self._spawn_stable_frames: int = 0
         self.flow_snapshot: dict[str, BagelFlow] = {}
         self.initial_clear_pending: bool = True
         self.last_return_status: str | None = None
@@ -141,6 +147,9 @@ class BagelApp(ZApplication):
         self.failure_history = []
         self.matched_map_id = None
         self._spawn_hud_misses = 0
+        self._spawn_dim_misses = 0
+        self._spawn_prev_signature = None
+        self._spawn_stable_frames = 0
         self.spawn_matcher = None
         self.flow_snapshot = {}
         self.initial_clear_pending = True
@@ -164,7 +173,71 @@ class BagelApp(ZApplication):
         except (OSError, ValueError) as error:
             return self.round_fail(f'贝果配置无效：{error}')
         bagel_usage.log_start(self.config)
+        if self.config.start_in_place:
+            started = self._try_start_in_place()
+            if started is not None:
+                return started
         return self.round_success()
+
+    def _try_start_in_place(self) -> OperationRoundResult | None:
+        """已在某个支持出生点附近时直接进该路线，不重开；不适用时返回 None。
+
+        开启 `start_in_place` 后，站在已支持路线的出生点附近即可直接开始那条路线，
+        不必重新入场 —— 反复重开会被随机到别的地图，调试固定路线时很费时间。
+        判定放在「检查贝果运行条件」末尾，那是本次任务的唯一出口，不会与
+        「零携带入场」的既有出边产生歧义。
+        """
+        self.screenshot()
+        if is_bagel_result(self):
+            return None
+        if not self.round_by_find_area(
+            self.last_screenshot, '战斗画面', '按键-普通攻击',
+        ).is_success:
+            self._spawn_hud_misses += 1
+            if self._spawn_hud_misses < bagel_const.START_IN_PLACE_HUD_MISS_LIMIT:
+                return self.round_wait(
+                    f'局内 HUD 暂未识别（{self._spawn_hud_misses}/'
+                    f'{bagel_const.START_IN_PLACE_HUD_MISS_LIMIT}），再看一帧',
+                    wait=bagel_const.START_IN_PLACE_HUD_WAIT,
+                )
+            log.info('原地开始：未识别到局内画面，照常零携带入场')
+            return None
+        self._spawn_hud_misses = 0
+        area = self.ctx.screen_loader.get_area('贝果-局内', '定位小地图')
+        if area is None:
+            return self.round_fail(BagelOperation.STATUS_ROUND_FAILED, data='缺少贝果定位小地图区域')
+        crop = cv2_utils.crop_image_only(self.last_screenshot, area.pc_rect)
+        crop = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+        map_id = self._spawn_matcher().match(crop)
+        spawn_status = self.SPAWN_STATUS.get(map_id) if map_id is not None else None
+        if spawn_status is None:
+            log.info('原地开始：当前小地图认不出支持出生点，照常零携带入场')
+            return None
+        # 认出了地图，还要确认玩家确实站在出生点附近：走远了直接跑该路线会从
+        # 错误位置起步，比重开更糟。
+        vision = self._spawn_matcher().vision(map_id)
+        location = vision.last_location
+        if location is None or location.position is None:
+            log.info('原地开始：认出%s但取不到坐标，照常零携带入场', spawn_status[1])
+            return None
+        distance = hypot(location.position[0] - vision.spawn[0], location.position[1] - vision.spawn[1])
+        if distance > bagel_const.START_IN_PLACE_SPAWN_RADIUS:
+            log.info(
+                '原地开始：认出%s但离出生点 %.1f 格（上限 %.1f），照常零携带入场',
+                spawn_status[1], distance, bagel_const.START_IN_PLACE_SPAWN_RADIUS,
+            )
+            return None
+        self.matched_map_id = map_id
+        self.attempts += 1
+        self._reset_spawn_frame_state()
+        log.info('原地开始：已在%s附近（距出生点 %.1f 格），直接开始收集', spawn_status[1], distance)
+        return self.round_success(spawn_status[0])
+
+    def _reset_spawn_frame_state(self) -> None:
+        """清掉跨帧状态，避免下一局沿用上一局的暗帧计数与签名。"""
+        self._spawn_dim_misses = 0
+        self._spawn_prev_signature = None
+        self._spawn_stable_frames = 0
 
     @node_from(from_name='检查贝果运行条件')
     @node_from(from_name='返回入口')

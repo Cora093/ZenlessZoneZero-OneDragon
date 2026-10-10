@@ -173,6 +173,12 @@ class BagelSettingInterface(VerticalScrollInterface, GroupIdMixin):
         )
         self.auto_clean_switch.value_changed.connect(self._refresh_clean_options)
         layout.addWidget(self.auto_clean_switch)
+        self.start_in_place_switch: SwitchSettingCard = SwitchSettingCard(
+            icon='',
+            title='原地开始',
+            content='开启后站在已支持的出生点附近即可直接进入该路线，不必重新入场',
+        )
+        layout.addWidget(self.start_in_place_switch)
         self.sell_interval_card: SpinBoxSettingCard = SpinBoxSettingCard(
             icon='', title='出售间隔',
             content=bagel_usage.SELL_INTERVAL_HINT,
@@ -200,7 +206,8 @@ class BagelSettingInterface(VerticalScrollInterface, GroupIdMixin):
         self.clean_types_card.value_changed.connect(self._refresh_clean_options)
         self.clean_qualities_card.value_changed.connect(self._refresh_clean_options)
         for card in (self.success_rounds_card, self.failure_retries_card,
-                     self.auto_clean_switch, self.sell_interval_card, self.clean_mode_card):
+                     self.auto_clean_switch, self.start_in_place_switch,
+                     self.sell_interval_card, self.clean_mode_card):
             _wrap_card(card)
         self.success_rounds_card.spin_box.setFixedWidth(140)
         self.failure_retries_card.spin_box.setFixedWidth(140)
@@ -253,6 +260,9 @@ class BagelSettingInterface(VerticalScrollInterface, GroupIdMixin):
         self.failure_retries_card.init_with_adapter(get_prop_adapter(self.config, 'max_failure_retries'))
         self.success_rounds_card.init_with_adapter(get_prop_adapter(self.config, 'max_success_rounds'))
         self.sell_interval_card.init_with_adapter(get_prop_adapter(self.config, 'sell_interval'))
+        self.start_in_place_switch.init_with_adapter(
+            get_prop_adapter(self.config, 'start_in_place'),
+        )
         self.auto_clean_switch._on_adapter_value_applied = self._clean_value_loaded
         self.clean_mode_card._on_adapter_value_applied = self._clean_value_loaded
         self.clean_types_card._on_adapter_value_applied = self._clean_value_loaded
