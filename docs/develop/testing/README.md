@@ -1,5 +1,7 @@
 # 测试方法论
 
+贝果按关键业务行为组织与精简，日常集和完整回归见[贝果测试入口](bagel.md)。本页的逐方法组织和逐节点分支要求不强制用于贝果；同一行为优先由最高层可稳定验证的测试覆盖。
+
 > `docs/develop/testing/` 的入口。测试代码在独立仓 `zzz-od-test`(主仓 `.gitignore` 忽略它,clone 到主仓根目录用)。本目录记**怎么跑测试 + 测试基建 + 怎么判断写哪些 + 怎么写**。
 
 ## 1. 测试在哪 / 怎么跑
@@ -205,11 +207,6 @@ git -C zzz-od-test add test/ && git -C zzz-od-test commit -m "..."
 - **导入**:不用 `src`(`from one_dragon.base.operation import Operation` ✓;`from src.one_dragon...` ✗)。
 - **异步超时**:异步测试方法必须加超时(如 `@pytest.mark.timeout(3)`),防止无限挂起。
 
-### 测试 fixture 图:尽量 webp q90
+### 测试素材
 
-测试 fixture 的整屏截图**默认转 webp q90**(省 ~90%,整屏识别无损效)。原则:**满足测试为准**——转后跑测试,过的留 webp;实测不过的保留 PNG。
-
-- **能压**:整屏画面匹配 / 事件识别(容差大)。
-- **保留 PNG**:精度敏感(小地图角度)、含细文字 OCR(webp q90 致 OCR 空)、**模板裁剪源**(webp lossy → 裁剪放大 artifacts → 模板 conf 降)。
-- **转换**:`cv2.imencode('.webp', img, [cv2.IMWRITE_WEBP_QUALITY, 90])` + `ndarray.tofile(path)`(中文路径安全,非 `cv2.imwrite`);批量见 [onboard skill 的 `convert_to_webp.py`](../../../skills/zzz-od-dev-screen-onboarding/convert_to_webp.py)。原 PNG 保留,确认无引用且测试过后手动删。
-- **改引用**:转后同步改测试代码 `.png`→`.webp`(保留 PNG 的不改)。
+格式、精度、尺寸例外、来源记录及迁移规则统一见[素材归档规范](../zzz/screenshot_archive.md)。不对精度敏感样本统一有损压缩。

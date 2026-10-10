@@ -234,9 +234,9 @@ uv run --env-file .env python -m zzz_od.gui.view.bagel.bagel_route_editor --inst
 | `bagel_step_editor/` | 步骤对话框 |
 | `bagel_flow_trial/` | 试跑线程 |
 
-每个文件主要检查一个被测方法。交互测试保留真实鼠标、对话框和撤销保存路径。业务执行器测试仍位于应用对应目录。
+界面测试按编辑动作、步骤对话框和试跑行为组织。交互测试使用Qt事件、对话框和撤销保存路径，不向真实游戏发送鼠标输入。业务执行器测试仍位于应用目录。
 
-业务和界面测试共用文件隔离 fixture。配置、草稿、运行记录和失败截图写入临时目录。发布流程和识别资源只从主仓读取。单独验证界面时运行：
+业务和界面测试共用文件隔离 fixture。配置、草稿、运行记录和失败截图写入临时目录。发布流程和识别资源只从主仓读取。统一日常与完整回归见[贝果测试入口](../../testing/bagel.md)。单独验证界面时运行：
 
 ```powershell
 uv run --env-file .env pytest zzz-od-test/test/zzz_od/gui/view/bagel/ -q
