@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 from math import hypot
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cv2
+import numpy as np
 
 from one_dragon.base.operation.operation_edge import node_from
 from one_dragon.base.operation.operation_node import operation_node
-from one_dragon.utils import cv2_utils
+from one_dragon.utils import cv2_utils, debug_utils
 from one_dragon.utils.log_utils import log
 from zzz_od.application.bagel import bagel_const, bagel_usage
 from zzz_od.application.bagel.bagel_deposit import BagelDeposit
@@ -183,9 +186,8 @@ class BagelApp(ZApplication):
         """已在某个支持出生点附近时直接进该路线，不重开；不适用时返回 None。
 
         开启 `start_in_place` 后，站在已支持路线的出生点附近即可直接开始那条路线，
-        不必重新入场 —— 反复重开会被随机到别的地图，调试固定路线时很费时间。
-        判定放在「检查贝果运行条件」末尾，那是本次任务的唯一出口，不会与
-        「零携带入场」的既有出边产生歧义。
+        避免反复重开被随机到别的地图。判定放在「检查贝果运行条件」末尾 ——
+        那是本次任务的唯一出口，不会与「零携带入场」的既有出边产生歧义。
         """
         self.screenshot()
         if is_bagel_result(self):
@@ -301,11 +303,146 @@ class BagelApp(ZApplication):
         spawn_status = self.SPAWN_STATUS.get(map_id)
         if spawn_status is not None:
             log.info('第 %s 次抽到%s，开始收集', self.attempts, spawn_status[1])
+            self._reset_spawn_frame_state()
+            self._record_spawn_diagnosis(crop, map_id)
             return self.round_success(spawn_status[0])
+        # 未识别：逐图留下定位细节，离线能复现是「没命中」还是「多图抢匹」。
+        for candidate, vision in self._spawn_matcher().routes.items():
+            location = vision.last_location
+            detail = (
+                f'({location.position[0]:.1f},{location.position[1]:.1f})'
+                if location is not None and location.position is not None
+                else (location.reason if location is not None else '未定位')
+            )
+            log.info('出生识别候选 %s: %s', candidate, detail)
+        # 全图都没命中，且画面明显偏暗：可能是入场动画未结束（实测出生帧
+        # 有效像素只有正常帧的一半，特征数不足 8 对匹配）。这时退出重开会白白浪费一局，
+        # 先留档再等几帧；画面正常却仍认不出，说明确实是未建档布局，按原逻辑退出。
+        if self._spawn_frame_is_dim(crop):
+            self._spawn_dim_misses += 1
+            self._record_spawn_diagnosis(crop, None)
+            if self._spawn_frame_is_settled(crop):
+                log.info(
+                    '出生点画面已稳定（帧间差收敛）但各底图均未命中，判定为未建档布局，不再等待',
+                )
+            elif self._spawn_dim_misses <= bagel_const.SPAWN_DIM_RETRY_LIMIT:
+                log.info(
+                    '出生点画面偏暗（%s/%s 有效像素），等画面稳定后再判',
+                    self._valid_pixels(crop), bagel_const.SPAWN_DIM_VALID_PIXELS,
+                )
+                return self.round_wait(
+                    f'出生点画面仍在入场过渡（{self._spawn_dim_misses}/{bagel_const.SPAWN_DIM_RETRY_LIMIT}），再看一帧',
+                    wait=0.3,
+                )
+        self._reset_spawn_frame_state()
         log.info('第 %s 次非支持出生点，退出重开', self.attempts)
         log.info('当前出生点不支持收集，正在退出重开。本次不计成功，不清理仓库，也不消耗整体重试次数。出生点重选没有次数上限。')
         log.info('抽到录像店或白鸽工地地铁站出生点后，程序开始收集。如需结束任务，请使用程序的停止操作。')
+        self._record_spawn_diagnosis(crop, None)
         return self.round_success(self.STATUS_SKIP)
+
+    def _spawn_frame_is_settled(self, minimap: MatLike) -> bool:
+        """画面是否已连续多帧停止重绘（定位小地图几乎不变）。
+
+        判据是帧间灰度差而不是「够不够亮」：稳定态的未建档布局（实测某未知区域
+        有效像素 2917~2921）同样落在偏暗门槛下方，但它是静止的，等下去永远不会
+        变亮；入场过渡态则每帧都在刷新（实测帧间差 17.7~31.3，稳定后 0.22~0.93），
+        两者相差 20 倍以上。因此画面一旦收敛就立刻退出，不再耗满重试次数。
+
+        要求连续 `SPAWN_STABLE_FRAMES` 帧都收敛：加载卡顿时入场过渡期可能恰好停住
+        一两帧（实测 0.30 -> 0.93 -> 31.26），只看单帧会把仍在入场的一局误杀。
+        """
+        if minimap is None or not minimap.size:
+            return True
+        signature = cv2.resize(
+            cv2.cvtColor(minimap, cv2.COLOR_BGR2GRAY), (48, 48), interpolation=cv2.INTER_AREA,
+        ).astype(np.float32)
+        previous = self._spawn_prev_signature
+        self._spawn_prev_signature = signature
+        if previous is None or previous.shape != signature.shape:
+            self._spawn_stable_frames = 0
+            return False
+        if float(np.abs(signature - previous).mean()) > bagel_const.SPAWN_STABLE_MAX_DIFF:
+            self._spawn_stable_frames = 0
+            return False
+        self._spawn_stable_frames += 1
+        return self._spawn_stable_frames >= bagel_const.SPAWN_STABLE_FRAMES
+
+    def _valid_pixels(self, minimap: MatLike) -> int:
+        """定位小地图里可用于匹配的有效像素数（各图口径一致，取第一张即可）。"""
+        try:
+            from zzz_od.application.bagel.bagel_map_locator import minimap_mask
+
+            vision = next(iter(self._spawn_matcher().routes.values()))
+            return int((minimap_mask(minimap, vision.map.mask_settings) > 0).sum())
+        except (StopIteration, AttributeError, TypeError, cv2.error):
+            return -1
+
+    def _spawn_frame_is_dim(self, minimap: MatLike) -> bool:
+        """画面是否处于入场过渡态（有效像素低于任何一张底图能定位的下限）。"""
+        valid = self._valid_pixels(minimap)
+        return 0 <= valid < bagel_const.SPAWN_DIM_VALID_PIXELS
+
+    def _record_spawn_diagnosis(self, minimap: MatLike, matched_map_id: str | None) -> None:
+        """把出生识别的输入与逐图结果落盘，供离线复现。
+
+        出生识别失败时只有一句 `insufficient_geometry`，离线无法判断是底图缺内容、
+        画面处于过渡态（变暗）、还是多图抢匹。这里保存识别用到的原始输入（全屏截图与
+        201x201 定位小地图）以及每张底图的特征数、定位结果与原因，离线可直接重放。
+        本步骤不消费 OCR 文本，OCR 结果见同一时刻日志中的 `OCR结果` 行。
+        写盘失败不影响主流程。文件名只用 ASCII：OpenCV 的 imwrite 读不了中文路径。
+        """
+        try:
+            from one_dragon.utils import os_utils
+            from zzz_od.application.bagel.bagel_map_locator import (
+                extract_features,
+                minimap_mask,
+                registration_image,
+            )
+
+            root = Path(debug_utils.get_debug_image_dir_path()) / 'bagel_spawn_diag'
+            root.mkdir(parents=True, exist_ok=True)
+            stamp = os_utils.now_timestamp_str()
+            folder = root / f'{stamp}_attempt{self.attempts:03d}'
+            folder.mkdir(parents=True, exist_ok=True)
+            if minimap is None or not minimap.size:
+                log.warning('出生识别诊断：没有定位小地图，仅记录发生')
+                return
+            cv2.imwrite(str(folder / 'minimap.png'), minimap)
+            if self.last_screenshot is not None:
+                cv2.imwrite(str(folder / 'full.png'), self.last_screenshot)
+            results = []
+            for candidate, vision in self._spawn_matcher().routes.items():
+                location = vision.last_location
+                entry = {
+                    'map_id': candidate,
+                    'position': None if location is None else location.position,
+                    'reason': None if location is None else location.reason,
+                    'inliers': None if location is None else location.inliers,
+                    'residual_px': None if location is None else location.median_residual_px,
+                    'elapsed_ms': None if location is None else location.elapsed_ms,
+                }
+                # 特征数量是判断「画面是不是太暗/过渡态」的关键指标。
+                valid = minimap_mask(minimap, vision.map.mask_settings)
+                for bank in vision.map.banks:
+                    current = extract_features(
+                        registration_image(minimap, bank.representation, vision.map.blur_size), valid,
+                    )
+                    entry[f'features_{bank.representation}'] = 0 if current.points is None else len(current.points)
+                entry['valid_pixels'] = int((valid > 0).sum())
+                results.append(entry)
+            payload = {
+                'attempt': self.attempts,
+                'matched_map_id': matched_map_id,
+                'screenshotted_at': stamp,
+                'results': results,
+            }
+            (folder / 'metrics.json').write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8',
+            )
+            log.info('出生识别诊断已保存：%s', folder)
+        except (OSError, ValueError, cv2.error, ImportError) as error:
+            log.warning('出生识别诊断保存失败：%s', error)
 
     @node_from(from_name='识别出生点', status=STATUS_SKIP)
     @operation_node(name='退出非支持局', screenshot_before_round=False)
