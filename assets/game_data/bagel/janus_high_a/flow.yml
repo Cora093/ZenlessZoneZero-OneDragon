@@ -60,6 +60,7 @@ steps:
     passed_tolerance: 5.0
   navigation:
     timeout: 75.0
+    brake_distance: 6.0
     final_mode: coordinate
 - id: move_safe_dd93c3156c3950aa8d95f43ac8d4829b
   action: move

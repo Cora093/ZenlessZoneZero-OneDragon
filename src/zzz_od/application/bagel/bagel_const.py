@@ -28,6 +28,15 @@ NAV_FORWARD_PRESS: float = 0.2
 NAV_ALIGN_PRESS: float = 0.08
 NAV_SAFE_APPROACH_PRESS: float = 0.08
 
+# 长按前进时是否顺带点一下冲刺键。冲刺键与闪避共用（键表里 dodge 默认 shift）：
+# 探索跑图时是冲刺，战斗中是闪避，贝果跑图流程本身不按闪避所以可以开。
+# 一次点按后游戏会保持冲刺状态，不需要按住不放。
+# 每个路点只点一次：点完这一次之后，本路点内后续所有长按 W 都不再补按冲刺，
+# 换了路点才允许再点。原因是冲刺惯性大，人工跑速 15~21 格/秒，补按几次就冲过
+# 目标（实测 2026-10-11 有一次把西南转角冲出目标 9.9 格，落点方向整个反掉，
+# 下一路点直接卡死失败）。
+NAV_SPRINT_ENABLED: bool = True
+
 # 「原地开始」模式：先读小地图，认得出支持出生点就直接进该路线流程，不重开。
 START_IN_PLACE_HUD_MISS_LIMIT: int = 4
 START_IN_PLACE_HUD_WAIT: float = 0.3
