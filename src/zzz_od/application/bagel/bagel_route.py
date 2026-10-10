@@ -9,9 +9,10 @@ from typing import Any
 
 from one_dragon.utils import os_utils
 
-SUPPORTED_MAP_IDS: tuple[str, ...] = ('janus_high_a', 'janus_high_b')
+SUPPORTED_MAP_IDS: tuple[str, ...] = ('janus_high_a', 'janus_high_b', 'janus_high_c')
 MAP_LABELS: dict[str, str] = {
     'janus_high_a': 'A · 录像店', 'janus_high_b': 'B · 白鸽工地地铁站',
+    'janus_high_c': 'C · 单廊双容器',
 }
 ROLE_LABELS: dict[str, str] = {
     'turn': '转折', 'entry': '保险箱入口', 'approach': '接近', 'target': '交互目标',
@@ -43,6 +44,7 @@ class BagelWaypoint:
     tolerance: float | None = None
     stop: bool = True
     passed_tolerance: float | None = None
+    heading: float | None = None
 
     @property
     def arrival_radius(self) -> float:
@@ -78,6 +80,8 @@ class BagelWaypoint:
             data['tolerance'] = self.tolerance
         if self.passed_tolerance is not None:
             data['passed_tolerance'] = self.passed_tolerance
+        if self.heading is not None:
+            data['heading'] = self.heading
         return data
 
 
@@ -108,13 +112,13 @@ class BagelRoute:
             raise ValueError('路点必须是至多 100 项的列表')
         points: list[BagelWaypoint] = []
         for value in values:
-            if not isinstance(value, dict) or set(value) - {'name', 'xy', 'stage', 'role', 'tolerance', 'stop', 'passed_tolerance'}:
+            if not isinstance(value, dict) or set(value) - {'name', 'xy', 'stage', 'role', 'tolerance', 'stop', 'passed_tolerance', 'heading'}:
                 raise ValueError('路点格式或字段无效')
             name, xy = value.get('name'), value.get('xy')
             stage, role = value.get('stage'), value.get('role')
             if not isinstance(name, str) or not name.strip() or len(name) > 60:
                 raise ValueError('路点名称须为 1 至 60 个字符')
-            stages = ('box', 'safe', 'move') if not complete and not check_roles else ('box', 'safe')
+            stages = ('box', 'safe', 'mech', 'move') if not complete and not check_roles else ('box', 'safe', 'mech')
             if stage not in stages or not isinstance(role, str) or role not in ROLE_LABELS:
                 raise ValueError('路点缺少有效路段或用途')
             if not isinstance(xy, (list, tuple)) or len(xy) != 2:
@@ -130,13 +134,27 @@ class BagelRoute:
             stop = value.get('stop', True)
             if not isinstance(stop, bool):
                 raise ValueError('停步要求必须是布尔值')
-            point = BagelWaypoint(name.strip(), tuple(_number(v, '坐标', -1000, 1000) for v in xy), stage, role, tolerance, stop, passed)
+            heading = value.get('heading')
+            if heading is not None:
+                heading = _number(heading, '到达朝向', -180, 180)
+                if stage != 'move':
+                    raise ValueError('只有普通移动可以指定到达朝向')
+            point = BagelWaypoint(
+                name.strip(),
+                tuple(_number(v, '坐标', -1000, 1000) for v in xy),
+                stage, role, tolerance, stop, passed, heading,
+            )
             points.append(point)
         route = cls(map_id, tuple(points))
-        box, safe = route.points_for('box'), route.points_for('safe')
-        if any(p.stage == 'move' for p in points) and (box or safe):
+        box, safe, mech = (
+            route.points_for('box'), route.points_for('safe'), route.points_for('mech'),
+        )
+        if any(p.stage == 'move' for p in points) and (box or safe or mech):
             raise ValueError('独立坐标移动不能混入容器路段')
-        if (not any(p.stage == 'move' for p in points) and tuple(points) != box + safe) or not points or (complete and not box):
+        containers = box + mech + safe
+        if (not any(p.stage == 'move' for p in points) and tuple(points) != containers) or (
+            not points or (complete and not box)
+        ):
             raise ValueError('路线须有武备箱段，且先到武备箱再到电子保险箱')
         if map_id == 'janus_high_b' and safe:
             raise ValueError('B 暂不支持电子保险箱段')
