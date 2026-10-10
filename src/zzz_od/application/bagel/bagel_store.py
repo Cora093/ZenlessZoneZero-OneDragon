@@ -7,7 +7,6 @@ from one_dragon.base.operation.operation_edge import node_from
 from one_dragon.base.operation.operation_node import operation_node
 from one_dragon.utils.log_utils import log
 from zzz_od.application.bagel.bagel_const import (
-    CONTAINER_PROMPT_AREAS,
     CONTAINER_TITLE_AREAS,
 )
 from zzz_od.application.bagel.bagel_item_vision import (
