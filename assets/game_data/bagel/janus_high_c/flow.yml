@@ -99,6 +99,7 @@ steps:
     tolerance: 4.0
   navigation:
     timeout: 75.0
+    brake_distance: 6.0
     final_mode: coordinate
 - id: move_a3
   action: move
@@ -125,6 +126,7 @@ steps:
     timeout: 75.0
     brake_distance: 6.0
     final_mode: coordinate
+    sprint: false
 - id: approach_safe
   action: approach
   name: 靠近电子保险箱前
