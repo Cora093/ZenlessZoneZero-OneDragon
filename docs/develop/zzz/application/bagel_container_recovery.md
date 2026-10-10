@@ -88,7 +88,7 @@
 
 - [恢复测试](../../../../zzz-od-test/test/zzz_od/application/bagel/bagel_run_flow/test_container_recovery.py)：检查执行器恢复行为。
 - [阶段边界测试](../../../../zzz-od-test/test/zzz_od/application/bagel/bagel_run_flow/test_container_boundaries.py)：检查容器阶段边界。
-- [应用测试](../../../../zzz-od-test/test/zzz_od/application/bagel/bagel_app/test_run_flow.py)：检查正式应用的失败处理。
+- [应用测试](../../../../zzz-od-test/test/zzz_od/application/bagel/bagel_app/test_execute_screens.py)：检查正式应用的失败处理。
 
 位移和跨阶段场景包含受控合成数据，用于验证执行逻辑。
 
