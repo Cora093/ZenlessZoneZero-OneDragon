@@ -26,6 +26,7 @@ from zzz_od.application.bagel.bagel_const import (
     NAV_SAFE_APPROACH_DISTANCE,
     NAV_SAFE_APPROACH_PRESS,
     NAV_SAFE_BRAKE_WAIT,
+    NAV_SPRINT_REPEAT_GAP,
     NAV_STOP_TURN_CAP,
     NAV_TELEPORT_AWAY_LIMIT,
     NAV_TELEPORT_BACK_LIMIT,
@@ -193,6 +194,31 @@ class BagelNavigate(BagelOperation):
         self.on_location_wait: Callable[[], None] | None = on_location_wait
         self._settle_until: float | None = None
         self._settled: bool = False
+        self._last_sprint_at: float | None = None
+
+    def _start_forward(self) -> None:
+        """长按前进，并点一下冲刺键。
+
+        冲刺只在「首次起按」时点一次：转向过程会反复调forward，若每轮都补按
+        冲刺键，打断转向反而更慢。冲刺键与闪避共用，本流程不按闪避所以安全。
+        """
+        self.ctx.controller.start_moving_forward()
+        if not self.navigation.effective_sprint:
+            return
+        now = self.last_screenshot_time
+        if (
+            self._last_sprint_at is not None
+            and now - self._last_sprint_at < NAV_SPRINT_REPEAT_GAP
+        ):
+            return
+        self.ctx.controller.start_sprinting_forward()
+        self._last_sprint_at = now
+        log.info('贝果导航已点冲刺键 map=%s stage=%s', self.map_id, self.destination)
+
+    def _release_forward(self) -> None:
+        """松开前进键。重复调用是安全的。"""
+        self._cruise_progress = None
+        self.ctx.controller.stop_moving_forward()
 
     def _select_waypoints(self) -> list[tuple[str, tuple[float, float]]]:
         """按显式路段选点，名称仅用于显示。"""
@@ -215,6 +241,7 @@ class BagelNavigate(BagelOperation):
         self._destination_braked = False
         self._settle_until = None
         self._settled = False
+        self._last_sprint_at = None
         if self._owns_recovery:
             self.recovery = ContainerRecovery(lambda: self.operation_usage_time)
         self._invalidate_heading()
@@ -554,7 +581,7 @@ class BagelNavigate(BagelOperation):
         if abs(angle_diff) <= NAV_TURN_DEADBAND:
             self._release_forward()
             return None
-        self.ctx.controller.start_moving_forward()
+        self._start_forward()
         effective = self.turn_compensator.turn(angle_diff, max_abs_angle_diff=NAV_STOP_TURN_CAP)
         self.pending_turn = (controller_angle, effective)
         # 转向指令已下发且镜头已转，不需要再短按 W 对齐箭头。
@@ -598,7 +625,7 @@ class BagelNavigate(BagelOperation):
             # 路边药粉等可拾取物会把镜头拉偏；不按 F，也不跟着小角度来回转。
             if self._cruise_progress is None and self.last_position is not None:
                 self._cruise_progress = (self.last_position, self.last_screenshot_time)
-            self.ctx.controller.start_moving_forward()
+            self._start_forward()
             return self.round_wait('忽略路上可拾取物')
         if abs(angle_diff) > NAV_TURN_DEADBAND:
             if (
@@ -607,7 +634,7 @@ class BagelNavigate(BagelOperation):
             ):
                 if self._cruise_progress is None and self.last_position is not None:
                     self._cruise_progress = (self.last_position, self.last_screenshot_time)
-                self.ctx.controller.start_moving_forward()
+                self._start_forward()
                 return self.round_wait(f'前往{name}')
             limited = self._fail_if_action_limit()
             if limited is not None:
@@ -615,14 +642,14 @@ class BagelNavigate(BagelOperation):
             self.last_cruise_turn_at = self.last_screenshot_time
             if self._cruise_progress is None and self.last_position is not None:
                 self._cruise_progress = (self.last_position, self.last_screenshot_time)
-            self.ctx.controller.start_moving_forward()
+            self._start_forward()
             effective = self.turn_compensator.turn(angle_diff, max_abs_angle_diff=NAV_CRUISE_TURN_CAP)
             self.pending_turn = (controller_angle, effective)
             self._record_input()
             return self.round_wait(f'行进转向 {angle_diff:.1f}度')
         if self._cruise_progress is None and self.last_position is not None:
             self._cruise_progress = (self.last_position, self.last_screenshot_time)
-        self.ctx.controller.start_moving_forward()
+        self._start_forward()
         return self.round_wait(f'前往{name}')
     def _finish_arrival(self) -> OperationRoundResult:
         """到达后的朝向对齐独占轮次；对齐到死区内即完成本步骤。"""
@@ -785,11 +812,6 @@ class BagelNavigate(BagelOperation):
             return None
         self._release_forward()
         return self.round_recoverable_fail('导航达到动作上限')
-
-    def _release_forward(self) -> None:
-        """松开前进键。重复调用是安全的。"""
-        self._cruise_progress = None
-        self.ctx.controller.stop_moving_forward()
 
     def _record_input(self) -> None:
         """校准、转向和短步计数，并拒绝复用动作前截图。按住观察不计。"""

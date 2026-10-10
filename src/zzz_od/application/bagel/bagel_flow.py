@@ -15,6 +15,7 @@ from one_dragon.utils import os_utils
 from zzz_od.application.bagel.bagel_const import (
     NAV_CRUISE_DISTANCE,
     NAV_SAFE_BRAKE_DISTANCE,
+    NAV_SPRINT_ENABLED,
 )
 from zzz_od.application.bagel.bagel_route import (
     MAP_LABELS,
@@ -75,6 +76,7 @@ class NavigationOptions:
     brake_distance: float | None = None
     final_mode: str | None = None
     interaction_distance: float | None = None
+    sprint: bool | None = None
 
     @property
     def effective_interaction_distance(self) -> float:
@@ -106,6 +108,16 @@ class NavigationOptions:
         """兼容旧文件隐式模式；新版读取时已明确正常移动或碎步接近。"""
         return self.final_mode or ('short_steps' if target == 'safe' else 'coordinate')
 
+    @property
+    def effective_sprint(self) -> bool:
+        """本步骤是否启用冲刺。
+
+        最后一段（电子保险箱前的接近点）需要关掉：那里贴着墙、容差小，
+        冲刺的惯性会把角色冲过头，反而错过到达判定。全局开关在
+        `bagel_const.NAV_SPRINT_ENABLED`，本项只在个别步骤上再关一次。
+        """
+        return NAV_SPRINT_ENABLED if self.sprint is None else self.sprint
+
     def to_dict(self) -> dict[str, Any]:
         """默认项不复制到文件中。"""
         return {
@@ -115,6 +127,7 @@ class NavigationOptions:
                 ('brake_distance', self.brake_distance),
                 ('final_mode', self.final_mode),
                 ('interaction_distance', self.interaction_distance),
+                ('sprint', self.sprint),
             )
             if value is not None
         }
@@ -127,8 +140,12 @@ class NavigationOptions:
             'brake_distance',
             'final_mode',
             'interaction_distance',
+            'sprint',
         }:
             raise ValueError('导航参数包含未知字段')
+        sprint = data.get('sprint')
+        if sprint is not None and not isinstance(sprint, bool):
+            raise ValueError('冲刺开关须写成 true 或 false')
         timeout = (
             _number(data['timeout'], '导航超时', 1, 600) if 'timeout' in data else None
         )
@@ -145,7 +162,7 @@ class NavigationOptions:
             if 'interaction_distance' in data
             else None
         )
-        return cls(timeout, brake, mode, interaction)
+        return cls(timeout, brake, mode, interaction, sprint)
 
 
 @dataclass(frozen=True)
@@ -328,6 +345,7 @@ class BagelFlow:
                 move_fields = {'timeout', 'brake_distance'}
                 if data['version'] == 4:
                     move_fields.add('final_mode')
+                move_fields.add('sprint')
                 if plain_move and set(value.get('navigation', {})) - move_fields:
                     raise ValueError('普通移动不接受靠近方式或交互识别范围')
                 if any(point.stage != ('move' if plain_move else target) for point in points):
