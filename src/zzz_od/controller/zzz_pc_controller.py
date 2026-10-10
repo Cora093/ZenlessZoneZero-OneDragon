@@ -178,6 +178,18 @@ class ZPcController(PcControllerBase):
         self.is_moving = False
         self.move_w(release=True)
 
+    def start_sprinting_forward(self) -> None:
+        """向前移动并点一下冲刺键，游戏会保持冲刺状态。
+
+        冲刺键与闪避共用（键表里 dodge 默认就是 shift），游戏中不同场景
+        是不同功能：探索跑图时是冲刺，战斗中是闪避。因此调用方要确认
+        当前流程不会按闪避，否则两者会互相打断。
+        """
+        if not self.is_moving:
+            self.is_moving = True
+            self.move_w(press=True)
+        self.btn_tap(self.action_keys['dodge'])
+
     def turn_by_distance(self, d: float):
         """
         横向转向 按距离转
