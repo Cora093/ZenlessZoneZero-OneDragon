@@ -114,7 +114,7 @@ class BagelRoute:
             stage, role = value.get('stage'), value.get('role')
             if not isinstance(name, str) or not name.strip() or len(name) > 60:
                 raise ValueError('路点名称须为 1 至 60 个字符')
-            stages = ('box', 'safe', 'move') if not complete and not check_roles else ('box', 'safe')
+            stages = ('box', 'safe', 'mech', 'move') if not complete and not check_roles else ('box', 'safe', 'mech')
             if stage not in stages or not isinstance(role, str) or role not in ROLE_LABELS:
                 raise ValueError('路点缺少有效路段或用途')
             if not isinstance(xy, (list, tuple)) or len(xy) != 2:
@@ -133,10 +133,15 @@ class BagelRoute:
             point = BagelWaypoint(name.strip(), tuple(_number(v, '坐标', -1000, 1000) for v in xy), stage, role, tolerance, stop, passed)
             points.append(point)
         route = cls(map_id, tuple(points))
-        box, safe = route.points_for('box'), route.points_for('safe')
-        if any(p.stage == 'move' for p in points) and (box or safe):
+        box, safe, mech = (
+            route.points_for('box'), route.points_for('safe'), route.points_for('mech'),
+        )
+        if any(p.stage == 'move' for p in points) and (box or safe or mech):
             raise ValueError('独立坐标移动不能混入容器路段')
-        if (not any(p.stage == 'move' for p in points) and tuple(points) != box + safe) or not points or (complete and not box):
+        containers = box + mech + safe
+        if (not any(p.stage == 'move' for p in points) and tuple(points) != containers) or (
+            not points or (complete and not box)
+        ):
             raise ValueError('路线须有武备箱段，且先到武备箱再到电子保险箱')
         if map_id == 'janus_high_b' and safe:
             raise ValueError('B 暂不支持电子保险箱段')
