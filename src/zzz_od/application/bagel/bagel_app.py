@@ -327,6 +327,11 @@ class BagelApp(ZApplication):
     @node_from(from_name='识别出生点', status=STATUS_A)
     @node_from(from_name='识别出生点', status=STATUS_B)
     @node_from(from_name='识别出生点', status=STATUS_C)
+    # 原地开始直接从「检查贝果运行条件」返回同样的状态，不经过识别出生点。
+    # 缺这三条时状态匹配会退化到 status=None 那条边，被送进零携带入场。
+    @node_from(from_name='检查贝果运行条件', status=STATUS_A)
+    @node_from(from_name='检查贝果运行条件', status=STATUS_B)
+    @node_from(from_name='检查贝果运行条件', status=STATUS_C)
     @operation_node(name='执行局内流程', screenshot_before_round=False)
     def run_flow(self) -> OperationRoundResult:
         """按出生地执行发布流程；与开发工具共用同一执行器。"""
