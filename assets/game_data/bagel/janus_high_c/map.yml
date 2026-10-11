@@ -63,7 +63,7 @@ reference_centers:
 - name: mech
   xy:
   - -21.9
-  - 20.8
+  - 19.8
 - name: a_spawn
   xy:
   - -78.5

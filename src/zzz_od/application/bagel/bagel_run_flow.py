@@ -301,6 +301,19 @@ class BagelRunFlow(BagelOperation):
         self._step_started_at = time.monotonic()
         self.emit('start', status=f'连续执行：{self.flow.steps[self.index].name}')
 
+    def _next_step_waypoint(self) -> tuple[float, float] | None:
+        """下一个步骤的路点坐标，供到达动作算「转向下一路点」的目标角度。
+
+        只认移动类步骤：到达动作装在移动步骤末尾，后面跟的通常也是移动步骤。
+        下一段不是移动（交互、收尾等）时没有方向可言，返回 None 让调用方退回纯计时。
+        """
+        for index in range(self.index + 1, len(self.flow.steps)):
+            step = self.flow.steps[index]
+            if step.action in ('move', 'approach') and step.waypoints:
+                return step.waypoints[-1].xy
+            return None
+        return None
+
     def build_operation(self, step: BagelStep) -> BagelOperation | None:
         """业务动作只有一个执行来源，工具不复制游戏交互。"""
         if step.action in ('move', 'approach'):
@@ -319,6 +332,7 @@ class BagelRunFlow(BagelOperation):
                 final_approach=step.action == 'approach',
                 on_observation=lambda data: self.emit('observation', **data),
                 arrive_hook=step.arrive_hook,
+                next_waypoint=self._next_step_waypoint(),
                 recovery=self._recovery_for(step) if step.action == 'approach' else None,
                 recovering=self._reapproach_pending,
                 on_location_wait=self.on_location_wait,

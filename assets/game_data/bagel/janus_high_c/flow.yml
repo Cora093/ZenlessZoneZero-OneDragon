@@ -26,7 +26,7 @@ steps:
   - name: 机械保险箱前
     xy:
     - -21.9
-    - 20.8
+    - 19.8
     stage: mech
     role: target
     stop: true
@@ -70,12 +70,9 @@ steps:
     final_mode: coordinate
   arrive_hook:
     actions:
-    - keys: [move_d]
-      seconds: 0.2
     - keys: [move_w,move_d]
-      seconds: 1.0
-    - keys: [move_w]
-      seconds: 0.8
+      seconds: 0.2
+      heading_to_next: true
 - id: move_a1
   action: move
   name: 走到武备箱拐角
