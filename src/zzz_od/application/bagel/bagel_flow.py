@@ -150,14 +150,33 @@ class NavigationOptions:
 
 @dataclass(frozen=True)
 class ArriveHookStep:
-    """到达后执行的一段按键。"""
+    """到达后执行的一段按键，可选在该段内把镜头转到指定朝向。
+
+    ``heading`` 为 None 时按纯计时走（原有行为）。给出后该段不再靠时间收尾，
+    而是每轮读角色箭头朝目标转向，直到偏差进入死区或耗尽 ``seconds`` 才进下一段。
+    转的是镜头而不是角色，因此与当前代理人的转身速度无关。
+
+    ``heading_to_next`` 表示「转到下一路点的方向」，由程序按下一路点坐标算出，
+    不写死角度；这样调整下一路点坐标时不必同步改这里。
+    """
 
     keys: tuple[str, ...]
     seconds: float
+    heading: float | None = None
+    heading_to_next: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化为可写回的字典。"""
-        return {'keys': list(self.keys), 'seconds': self.seconds}
+        """序列化到写回格式，缺省的转向项不输出。"""
+        data: dict[str, Any] = {'keys': list(self.keys), 'seconds': self.seconds}
+        if self.heading is not None and not self.heading_to_next:
+            data['heading'] = self.heading
+        if self.heading_to_next:
+            data['heading_to_next'] = True
+        return data
+
+    def uses_heading(self) -> bool:
+        """该段是否需要闭环转向。"""
+        return self.heading is not None or self.heading_to_next
 
 
 @dataclass(frozen=True)
@@ -186,15 +205,27 @@ class ArriveHook:
     @staticmethod
     def _parse_step(value: dict[str, Any]) -> ArriveHookStep:
         """解析一段按键，时长上限 5 秒避免卡住整条路线。"""
-        if not isinstance(value, dict) or set(value) - {'keys', 'seconds'}:
+        if not isinstance(value, dict) or set(value) - {
+            'keys', 'seconds', 'heading', 'heading_to_next',
+        }:
             raise ValueError('到达动作段格式或字段无效')
         keys = value.get('keys')
         if not isinstance(keys, list) or not keys or not all(
             isinstance(k, str) and k for k in keys
         ):
             raise ValueError('到达动作必须给出至少一个按键名')
+        to_next = value.get('heading_to_next', False)
+        if not isinstance(to_next, bool):
+            raise ValueError('到达动作的朝向来源必须是真假值')
+        heading = value.get('heading')
+        if heading is not None and to_next:
+            raise ValueError('到达动作段不能同时指定朝向角度和朝向下一路点')
+        if to_next:
+            heading = 0.0  # 占位，实际角度在执行时按下一路点算
         return ArriveHookStep(
             tuple(keys), _number(value.get('seconds'), '到达动作时长', 0.1, 5.0),
+            heading=heading if heading is None else _number(heading, '到达动作朝向', -360.0, 360.0),
+            heading_to_next=to_next,
         )
 
 

@@ -19,6 +19,7 @@ from zzz_od.application.bagel.bagel_const import (
     NAV_CRUISE_TURN_GAP,
     NAV_CRUISE_TURN_LIMIT,
     NAV_FORWARD_PRESS,
+    NAV_HOOK_HEADING_MISS_LIMIT,
     NAV_HOOK_STEP_WAIT,
     NAV_INITIAL_LOCATE_MISS_LIMIT,
     NAV_INITIAL_LOCATE_WAIT,
@@ -105,6 +106,7 @@ class BagelNavigate(BagelOperation):
         recovering: bool = False,
         on_location_wait: Callable[[], None] | None = None,
         arrive_hook: ArriveHook | None = None,
+        next_waypoint: tuple[float, float] | None = None,
     ) -> None:
         """普通移动使用独立坐标；只有靠近容器才需要目标类型。"""
         if destination not in ('box', 'safe', 'mech', 'move'):
@@ -166,12 +168,19 @@ class BagelNavigate(BagelOperation):
         self._last_angle_diff: float | None = None
         # 到达动作配置；None 表示本步骤没有配置 hook。
         self.arrive_hook: ArriveHook | None = arrive_hook
+        # 流程里下一个步骤的路点。到达动作要「转向下一路点方向」时按它算角度：
+        # 每个移动步骤是独立操作实例，只带自己那一段路点，取不到下一步的方向。
+        self.next_waypoint: tuple[float, float] | None = next_waypoint
         # hook 状态：是否已启动、待执行的段队列、当前段序号与剩余秒数。
         self._hook_started: bool = False
         self._hook_queue: tuple[ArriveHookStep, ...] = ()
         self._hook_index: int = 0
         self._hook_left: float = 0.0
         self._held_move_keys: tuple[str, ...] = ()
+        # 当前 hook 段要闭环转向的目标朝向；None 表示该段按纯计时走。
+        self._hook_heading: float | None = None
+        # 连续读不到角色箭头的轮数；到上限就放弃转向、按计时收尾。
+        self._hook_heading_misses: int = 0
         # 到达后对齐朝向（heading）的独占状态。
         self._arriving: bool = False
         self._arrive_point: BagelWaypoint | None = None
@@ -642,9 +651,12 @@ class BagelNavigate(BagelOperation):
     def _run_arrive_hook(self) -> OperationRoundResult | None:
         """到达步骤终点后执行配置的位移动作；未配置或已执行完返回 None。
 
-        hook 由流程配置显式声明（如 W+D 按住两秒），方向固定、不看朝向：
-        用于贴着拐角内侧过弯或脱离追击的敌人。位移会改变角色位置，
-        下一步骤的巡航自然基于新坐标。
+        hook 由流程配置显式声明（如 W+D 按住两秒），用于贴着拐角内侧过弯或脱离
+        追击的敌人。位移会改变角色位置，下一步骤的巡航自然基于新坐标。
+
+        段内可以要求闭环转向（``heading`` / ``heading_to_next``）：此时不再按时间
+        收尾，而是每轮读角色箭头补转，直到进入死区才进下一段。朝向没写就退回
+        原来的纯计时行为。
         """
         hook = self.arrive_hook
         if hook is None or self._hook_started:
@@ -653,17 +665,83 @@ class BagelNavigate(BagelOperation):
         self._hook_started = True
         self._hook_queue = hook.actions
         self._hook_index = 0
-        first = self._hook_queue[0]
-        self._hook_left = first.seconds
-        self._hold_move_keys(first.keys)
+        return self._start_hook_step()
+
+    def _start_hook_step(self) -> OperationRoundResult:
+        """开始执行当前段：按下配置的键，并算出本段要不要闭环转向。"""
+        step = self._hook_queue[self._hook_index]
+        self._hook_left = step.seconds
+        self._hook_heading_misses = 0
+        self._hook_heading = None
+        if step.uses_heading():
+            resolved = (
+                self._next_waypoint_heading() if step.heading_to_next else step.heading
+            )
+            if resolved is not None:
+                self._hook_heading = resolved % 360
+        self._hold_move_keys(step.keys)
         self._record_input()
-        label = "+".join(key[-1].upper() for key in first.keys)
+        label = '+'.join(key[-1].upper() for key in step.keys)
+        if self._hook_heading is None:
+            return self.round_wait(
+                f"到达后按住 {label} {step.seconds:g} 秒", wait=NAV_HOOK_STEP_WAIT,
+            )
         return self.round_wait(
-            f"到达后按住 {label} {first.seconds:g} 秒", wait=NAV_HOOK_STEP_WAIT,
+            f'到达后按住 {label} 并转到 {self._hook_heading:.0f} 度',
+            wait=NAV_HOOK_STEP_WAIT,
         )
 
+    def _next_waypoint_heading(self) -> float | None:
+        """按下一路点坐标算出应朝向的角度（与巡航同一套坐标，0=东、90=南）。
+
+        y 必须写``position - target`` 而不是相反：``atan2`` 在 y 轴向下的地图
+        坐标里，正角落在南向；导航主循环算巡航目标角时用的是「自己减目标」，
+        两处保持一致才不会左右反向。
+        """
+        target = self.next_waypoint
+        position = self.last_position
+        if target is None or position is None:
+            return None
+        return degrees(atan2(
+            position[1] - target[1], position[0] - target[0],
+        )) % 360
+
+    def _hook_turn_done(self) -> bool:
+        """本段是否已完成转向；顺带下发补转指令。
+
+        返回 True 表示朝向已对齐（或已放弃转向），调用方可以按计时推进本段。
+        读不到角色箭头时不硬撑：连续几帧读不到就放弃转向，避免整条路线卡死。
+        """
+        assert self._hook_heading is not None
+        image_angle = self.vision.player_angle(self.minimap())
+        if image_angle is None:
+            self._hook_heading_misses += 1
+            if self._hook_heading_misses >= NAV_HOOK_HEADING_MISS_LIMIT:
+                log.info(
+                    '贝果到达动作转向放弃：连续 %d 帧读不到角色箭头 map=%s',
+                    self._hook_heading_misses, self.map_id,
+                )
+                self._hook_heading = None
+                return True
+            return False
+        self._hook_heading_misses = 0
+        controller_angle, angle_diff = self._observe_heading(image_angle, self._hook_heading)
+        if abs(angle_diff) <= NAV_TURN_DEADBAND:
+            return True
+        # 转向期间不松前进键：转镜头不停步，敌人抓不到空档。
+        # 镜头转动与代理人无关，因此不同代理人的转角一致。
+        effective = self.turn_compensator.turn(angle_diff, max_abs_angle_diff=NAV_STOP_TURN_CAP)
+        self.pending_turn = (controller_angle, effective)
+        self._record_input()
+        return False
+
     def _continue_arrive_hook(self) -> OperationRoundResult:
-        """到达动作的后续轮次：段内计时，段间自动衔接，全部完成即达成路点。"""
+        """到达动作的后续轮次：段内计时或转向对齐，段间自动衔接。"""
+        if self._hook_heading is not None and not self._hook_turn_done():
+            # 还没转到目标朝向：这一轮只补转向位移，不倒计时。
+            return self.round_wait(
+                f'到达后转向中 {self._hook_heading:.0f} 度', wait=NAV_HOOK_STEP_WAIT,
+            )
         self._hook_left -= NAV_HOOK_STEP_WAIT
         self._record_input()
         if self._hook_left > 0:
@@ -673,14 +751,7 @@ class BagelNavigate(BagelOperation):
         self._release_move_keys()
         self._hook_index += 1
         if self._hook_index < len(self._hook_queue):
-            nxt = self._hook_queue[self._hook_index]
-            self._hook_left = nxt.seconds
-            self._hold_move_keys(nxt.keys)
-            self._record_input()
-            label = "+".join(key[-1].upper() for key in nxt.keys)
-            return self.round_wait(
-                f"到达后按住 {label} {nxt.seconds:g} 秒", wait=NAV_HOOK_STEP_WAIT,
-            )
+            return self._start_hook_step()
         self.heading_aligned = False
         # hook 执行完毕即视为本步骤的路点已达成：hook 的位移本就会把
         # 角色带离路点（如拐进通道），若回到主流程重新判定到达，
