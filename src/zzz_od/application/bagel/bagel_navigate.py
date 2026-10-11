@@ -544,7 +544,7 @@ class BagelNavigate(BagelOperation):
         if angle is None:
             self._release_forward()
             return self.round_recoverable_fail('无法识别角色箭头，停止移动')
-        target_angle = degrees(atan2(position[1] - target[1], target[0] - position[0])) % 360
+        target_angle = self._bearing_to(position, target)
         # 配置了到达动作的步骤全程保持巡航：接近段停车对齐会被敌人追上，
         # 到达判定成立后立即执行 hook，用位移代替停顿。
         keep_cruising = (
@@ -718,20 +718,35 @@ class BagelNavigate(BagelOperation):
             wait=NAV_HOOK_STEP_WAIT,
         )
 
-    def _next_waypoint_heading(self) -> float | None:
-        """按下一路点坐标算出应朝向的角度（与巡航同一套坐标，0=东、90=南）。
+    @staticmethod
+    def _bearing_to(
+        position: tuple[float, float], target: tuple[float, float],
+    ) -> float:
+        """从 ``position`` 指向 ``target`` 的方位角，与 ``_observe_heading`` 同坐标系。
 
-        y 必须写``position - target`` 而不是相反：``atan2`` 在 y 轴向下的地图
-        坐标里，正角落在南向；导航主循环算巡航目标角时用的是「自己减目标」，
-        两处保持一致才不会左右反向。
+        朝向角由角色箭头换算而来（``_observe_heading`` 里``controller_angle =
+        (-image_angle) % 360``），是「角色正朝着的世界方向」。目标角必须用同一个
+        约定，也就是从自己指向目标：``atan2(target - position)``。
+
+        早先两处都写成 ``atan2(position - target)``，取的是反向向量。两边约定一致
+        时不会左右反向，但角色本来就朝目标时会算出 ≈ ±180 度 —— 正好落在
+        ``angle_delta`` 的 ±180 分支上，表现为先转身 180 度背对目标，再转回来。
+        2026-10-11 实机记录：``回到长廊`` 段 agent 朝东、目标在东北，本该转 +22 度，
+        实际下发 -170.9 度，转完 90 度限幅又发 -111 度才收敛。
+
+        约定只在这里定义一次，巡航、到达动作、拐点判定都调用它，避免再走偏。
         """
+        return degrees(atan2(
+            target[1] - position[1], target[0] - position[0],
+        )) % 360
+
+    def _next_waypoint_heading(self) -> float | None:
+        """按下一路点坐标算出应朝向的角度；坐标系见 :meth:`_bearing_to`。"""
         target = self.next_waypoint
         position = self.last_position
         if target is None or position is None:
             return None
-        return degrees(atan2(
-            position[1] - target[1], position[0] - target[0],
-        )) % 360
+        return self._bearing_to(position, target)
 
     def _hook_turn_done(self) -> bool:
         """本段是否已完成转向；顺带下发补转指令。
@@ -828,7 +843,7 @@ class BagelNavigate(BagelOperation):
         if angle is None:
             return False
         controller_angle = (-angle) % 360
-        target_angle = degrees(atan2(position[1] - target[1], target[0] - position[0])) % 360
+        target_angle = self._bearing_to(position, target)
         return abs(cal_utils.angle_delta(controller_angle, target_angle)) > 90
 
     def _tap_align(self) -> OperationRoundResult:
