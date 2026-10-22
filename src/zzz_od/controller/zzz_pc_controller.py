@@ -102,6 +102,17 @@ class ZPcController(PcControllerBase):
         """闪避"""
         self._action_btn(self.action_keys['dodge'], press, press_time, release)
 
+    def start_sprinting_forward(self) -> None:
+        """向前移动并点一下冲刺键，游戏会保持冲刺状态。
+
+        冲刺键与闪避共用（键表里 dodge 默认就是 shift），游戏中不同场景
+        是不同功能：探索跑图时是冲刺，战斗中是闪避。因此调用方要确认
+        当前流程不会按闪避，否则两者会互相打断。
+        """
+        if not self.is_moving:
+            self.start_moving_forward()
+        self.btn_tap(self.action_keys['dodge'])
+
     def switch_next(self, press: bool = False, press_time: float | None = None, release: bool = False) -> None:
         """切换角色-下一个"""
         self._action_btn(self.action_keys['switch_next'], press, press_time, release)

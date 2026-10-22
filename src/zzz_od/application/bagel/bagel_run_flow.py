@@ -324,6 +324,19 @@ class BagelRunFlow(BagelOperation):
         self._step_started_at = time.monotonic()
         self.emit('start', status=f'连续执行：{self.flow.steps[self.index].name}')
 
+    def _next_segment_waypoint(self) -> tuple[float, float] | None:
+        """下一段的第一个路点坐标 —— 本段走完后要往哪去。
+
+        独立坐标段只有单个路点，转角发生在两段之间，所以转向要知道下一段的目标。
+        下一段没有路点（交互、结算等）时返回 None，表示不转向。
+        """
+        if self.cursor + 1 >= len(self.indices):
+            return None
+        next_step = self.flow.steps[self.indices[self.cursor + 1]]
+        if not next_step.waypoints:
+            return None
+        return next_step.waypoints[0].xy
+
     def build_operation(self, step: BagelStep) -> BagelOperation | None:
         """业务动作只有一个执行来源，工具不复制游戏交互。"""
         if step.action in ('move', 'approach'):
@@ -344,6 +357,7 @@ class BagelRunFlow(BagelOperation):
                 recovery=self._recovery_for(step) if step.action == 'approach' else None,
                 recovering=self._reapproach_pending,
                 on_location_wait=self.on_location_wait,
+                next_waypoint_xy=self._next_segment_waypoint(),
             )
         if step.action == 'interact':
             if step.target == 'box':

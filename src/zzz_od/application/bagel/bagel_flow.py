@@ -14,8 +14,10 @@ import yaml
 from one_dragon.utils import os_utils
 from zzz_od.application.bagel.bagel_const import (
     CONTAINER_TITLE_AREAS,
+    NAV_ARRIVE_MOVE_KEYS,
     NAV_CRUISE_DISTANCE,
     NAV_SAFE_BRAKE_DISTANCE,
+    NAV_SPRINT_ENABLED,
 )
 from zzz_od.application.bagel.bagel_route import (
     MAP_LABELS,
@@ -72,6 +74,21 @@ class NavigationOptions:
     brake_distance: float | None = None
     final_mode: str | None = None
     interaction_distance: float | None = None
+    arrive_heading: float | None = None
+    arrive_heading_to_next: bool = False
+    arrive_move_keys: tuple[str, ...] | None = None
+    arrive_move_seconds: float | None = None
+    sprint: bool | None = None
+
+    @property
+    def uses_arrive_heading(self) -> bool:
+        """该步骤到达后是否需要闭环转向镜头。"""
+        return self.arrive_heading is not None or self.arrive_heading_to_next
+
+    @property
+    def effective_sprint(self) -> bool:
+        """逐段配置冲刺；未配置时跟随全局开关。"""
+        return self.sprint if self.sprint is not None else NAV_SPRINT_ENABLED
 
     @property
     def effective_interaction_distance(self) -> float:
@@ -105,16 +122,28 @@ class NavigationOptions:
 
     def to_dict(self) -> dict[str, Any]:
         """默认项不复制到文件中。"""
-        return {
+        data = {
             key: value
             for key, value in (
                 ('timeout', self.timeout),
                 ('brake_distance', self.brake_distance),
                 ('final_mode', self.final_mode),
                 ('interaction_distance', self.interaction_distance),
+                ('sprint', self.sprint),
             )
             if value is not None
         }
+        # 「转向下一路点」时角度由程序按坐标算，占位值不写回，
+        # 否则 from_dict 会以「角度与下一路点不能并存」拒绝读回。
+        if self.arrive_heading_to_next:
+            data['arrive_heading_to_next'] = True
+        elif self.arrive_heading is not None:
+            data['arrive_heading'] = self.arrive_heading
+        if self.arrive_move_keys:
+            data['arrive_move_keys'] = list(self.arrive_move_keys)
+        if self.arrive_move_seconds is not None:
+            data['arrive_move_seconds'] = self.arrive_move_seconds
+        return data
 
     @classmethod
     def from_dict(cls, data: object) -> NavigationOptions:
@@ -124,6 +153,11 @@ class NavigationOptions:
             'brake_distance',
             'final_mode',
             'interaction_distance',
+            'arrive_heading',
+            'arrive_heading_to_next',
+            'arrive_move_keys',
+            'arrive_move_seconds',
+            'sprint',
         }:
             raise ValueError('导航参数包含未知字段')
         timeout = (
@@ -142,7 +176,43 @@ class NavigationOptions:
             if 'interaction_distance' in data
             else None
         )
-        return cls(timeout, brake, mode, interaction)
+        to_next = data.get('arrive_heading_to_next', False)
+        if not isinstance(to_next, bool):
+            raise ValueError('到达转向的朝向来源必须是真假值')
+        arrive_heading = (
+            _number(data['arrive_heading'], '到达转向角度', -360.0, 360.0)
+            if 'arrive_heading' in data
+            else None
+        )
+        if arrive_heading is not None and to_next:
+            raise ValueError('到达转向不能同时指定角度和转向下一路点')
+        move_keys = data.get('arrive_move_keys')
+        if move_keys is not None:
+            if (
+                not isinstance(move_keys, list)
+                or not move_keys
+                or any(key not in NAV_ARRIVE_MOVE_KEYS for key in move_keys)
+            ):
+                raise ValueError('到达后位移只能指定已知的移动键')
+            move_keys = tuple(move_keys)
+        move_seconds = (
+            _number(data['arrive_move_seconds'], '到达后位移时长', 0.05, 5)
+            if 'arrive_move_seconds' in data
+            else None
+        )
+        if move_keys is not None and move_seconds is None:
+            raise ValueError('到达后位移必须同时指定时长')
+        if move_seconds is not None and move_keys is None:
+            raise ValueError('到达后位移时长必须同时指定移动键')
+        sprint = data.get('sprint')
+        if sprint is not None and not isinstance(sprint, bool):
+            raise ValueError('冲刺开关必须是真假值')
+        return cls(
+            timeout, brake, mode, interaction,
+            # 转向下一路点时角度由程序按坐标算，这里先占位。
+            0.0 if to_next else arrive_heading, to_next,
+            move_keys, move_seconds, sprint,
+        )
 
 
 @dataclass(frozen=True)
@@ -271,6 +341,15 @@ class BagelFlow:
                 move_fields = {'timeout', 'brake_distance'}
                 if data['version'] == 4:
                     move_fields.add('final_mode')
+                # 到达后转向镜头是纯移动行为，容器接近方式（碎步、交互距离）
+                # 仍然不适用于普通移动。
+                move_fields.add('arrive_heading')
+                move_fields.add('arrive_heading_to_next')
+                # 冲刺同样是纯移动行为：逐段可关靠这个字段。
+                move_fields.add('sprint')
+                # 到达后的位移与转向也是纯移动行为。
+                move_fields.add('arrive_move_keys')
+                move_fields.add('arrive_move_seconds')
                 if plain_move and set(value.get('navigation', {})) - move_fields:
                     raise ValueError('普通移动不接受靠近方式或交互识别范围')
                 if any(point.stage != ('move' if plain_move else target) for point in points):
