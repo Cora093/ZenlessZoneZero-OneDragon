@@ -140,6 +140,8 @@ class BagelNavigate(BagelOperation):
         self.last_position: tuple[float, float] | None = None
         self._cruise_progress: tuple[tuple[float, float], float] | None = None
         self.last_cruise_turn_at: float | None = None
+        # 已经点过冲刺的路点序号；每个路点只点一次，换段才允许再点。
+        self._sprint_waypoint_index: int | None = None
         self._spawn_far: int = 0
         self._spawn_miss: int = 0
         self._safe_brake_until: float | None = None
@@ -468,7 +470,7 @@ class BagelNavigate(BagelOperation):
             # 路边药粉等可拾取物会把镜头拉偏；不按 F，也不跟着小角度来回转。
             if self._cruise_progress is None and self.last_position is not None:
                 self._cruise_progress = (self.last_position, self.last_screenshot_time)
-            self.ctx.controller.start_moving_forward()
+            self._start_forward()
             return self.round_wait('忽略路上可拾取物')
         if abs(angle_diff) > NAV_TURN_DEADBAND:
             if (
@@ -477,7 +479,7 @@ class BagelNavigate(BagelOperation):
             ):
                 if self._cruise_progress is None and self.last_position is not None:
                     self._cruise_progress = (self.last_position, self.last_screenshot_time)
-                self.ctx.controller.start_moving_forward()
+                self._start_forward()
                 return self.round_wait(f'前往{name}')
             limited = self._fail_if_action_limit()
             if limited is not None:
@@ -485,14 +487,14 @@ class BagelNavigate(BagelOperation):
             self.last_cruise_turn_at = self.last_screenshot_time
             if self._cruise_progress is None and self.last_position is not None:
                 self._cruise_progress = (self.last_position, self.last_screenshot_time)
-            self.ctx.controller.start_moving_forward()
+            self._start_forward()
             effective = self.turn_compensator.turn(angle_diff, max_abs_angle_diff=NAV_CRUISE_TURN_CAP)
             self.pending_turn = (controller_angle, effective)
             self._record_input()
             return self.round_wait(f'行进转向 {angle_diff:.1f}度')
         if self._cruise_progress is None and self.last_position is not None:
             self._cruise_progress = (self.last_position, self.last_screenshot_time)
-        self.ctx.controller.start_moving_forward()
+        self._start_forward()
         return self.round_wait(f'前往{name}')
 
     def _align_to_heading(
@@ -576,10 +578,32 @@ class BagelNavigate(BagelOperation):
         self._release_forward()
         return self.round_recoverable_fail('导航达到动作上限')
 
+    def _start_forward(self) -> None:
+        """长按前进，并在本路点第一次起按时顺带点一下冲刺。
+
+        冲刺键与闪避共用，本流程不按闪避所以可以开。一次点按后游戏会保持冲刺
+        状态，所以每个路点点一次就够：转向、停车转向、重新起步都会反复调这里，
+        补按冲刺会让惯性一路累积把角色冲出目标（实测 2026-10-11 有一次把西南
+        转角冲出目标 9.9 格，落点方向整个反掉，下一路点直接卡死）。
+        """
+        self.ctx.controller.start_moving_forward()
+        if not self.navigation.effective_sprint:
+            return
+        if self._sprint_waypoint_index == self.waypoint_index:
+            return
+        self.ctx.controller.start_sprinting_forward()
+        self._sprint_waypoint_index = self.waypoint_index
+        log.info(
+            '贝果导航已点冲刺键 map=%s stage=%s waypoint=%s',
+            self.map_id, self.destination, self.waypoint_index,
+        )
+
     def _release_forward(self) -> None:
         """松开前进键。重复调用是安全的。"""
         self._cruise_progress = None
         self.ctx.controller.stop_moving_forward()
+        # 换段或停车后允许下一个路点重新点一次冲刺。
+        self._sprint_waypoint_index = None
 
     def _record_input(self) -> None:
         """校准、转向和短步计数，并拒绝复用动作前截图。按住观察不计。"""

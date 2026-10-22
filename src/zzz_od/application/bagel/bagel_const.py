@@ -36,6 +36,12 @@ NAV_LOCATE_MISS_LIMIT: int = 3
 # 电子保险箱完成四轮点按后等待搜索结果，点按时机按光圈状态判断。
 SAFE_UNLOCK_HITS: int = 4
 
+# 长按前进时是否顺带点一下冲刺键。冲刺键与闪避共用（键表里 dodge 默认 shift）：
+# 探索跑图时是冲刺，战斗中是闪避，贝果跑图流程本身不按闪避所以可以开。
+# 一次点按后游戏会保持冲刺状态，不需要按住不放；每个路点只点一次，理由见
+# 导航侧 `_start_forward` 的说明。
+NAV_SPRINT_ENABLED: bool = True
+
 # 仓库清理：default 用下面的固定组合；custom 按 clean_steps 顺序，每步用该步的类型和品质。
 CLEAN_MODE_DEFAULT: str = 'default'
 CLEAN_MODE_CUSTOM: str = 'custom'

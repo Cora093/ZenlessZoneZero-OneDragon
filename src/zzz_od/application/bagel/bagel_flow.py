@@ -15,6 +15,7 @@ from one_dragon.utils import os_utils
 from zzz_od.application.bagel.bagel_const import (
     NAV_CRUISE_DISTANCE,
     NAV_SAFE_BRAKE_DISTANCE,
+    NAV_SPRINT_ENABLED,
 )
 from zzz_od.application.bagel.bagel_route import (
     MAP_LABELS,
@@ -71,6 +72,12 @@ class NavigationOptions:
     brake_distance: float | None = None
     final_mode: str | None = None
     interaction_distance: float | None = None
+    sprint: bool | None = None
+
+    @property
+    def effective_sprint(self) -> bool:
+        """逐段配置冲刺；未配置时跟随全局开关。"""
+        return self.sprint if self.sprint is not None else NAV_SPRINT_ENABLED
 
     @property
     def effective_interaction_distance(self) -> float:
@@ -111,6 +118,7 @@ class NavigationOptions:
                 ('brake_distance', self.brake_distance),
                 ('final_mode', self.final_mode),
                 ('interaction_distance', self.interaction_distance),
+                ('sprint', self.sprint),
             )
             if value is not None
         }
@@ -123,6 +131,7 @@ class NavigationOptions:
             'brake_distance',
             'final_mode',
             'interaction_distance',
+            'sprint',
         }:
             raise ValueError('导航参数包含未知字段')
         timeout = (
@@ -141,7 +150,10 @@ class NavigationOptions:
             if 'interaction_distance' in data
             else None
         )
-        return cls(timeout, brake, mode, interaction)
+        sprint = data.get('sprint')
+        if sprint is not None and not isinstance(sprint, bool):
+            raise ValueError('冲刺开关必须是真假值')
+        return cls(timeout, brake, mode, interaction, sprint)
 
 
 @dataclass(frozen=True)
