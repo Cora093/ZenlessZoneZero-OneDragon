@@ -36,6 +36,38 @@ NAV_LOCATE_MISS_LIMIT: int = 3
 # 电子保险箱完成四轮点按后等待搜索结果，点按时机按光圈状态判断。
 SAFE_UNLOCK_HITS: int = 4
 
+# 容器类型 -> 搜查面板标题区域。三种标题在同一位置、不同文案，必须逐个判：
+# 面板已开时目标名可能对不上（标题渲染慢一帧），只看目标那一种会漏判成「无面板」。
+CONTAINER_TITLE_AREAS: dict[str, str] = {
+    'box': '搜查容器标题',
+    'safe': '电子保险箱标题',
+    'mech': '机械保险箱标题',
+}
+# 容器类型 -> 局内交互提示区域。
+CONTAINER_PROMPT_AREAS: dict[str, str] = {
+    'box': '武备箱交互',
+    'safe': '电子保险箱交互',
+    'mech': '机械保险箱交互',
+}
+# 需要按住交互键才开箱的容器（按不够箱子不响应）；其余容器点按即可。
+CONTAINER_HOLD_TYPES: frozenset[str] = frozenset({'mech'})
+# 机械保险箱要按住 3.5 秒才开 —— 按不够箱子完全不响应，会被当成开箱失败。
+# 恢复预算 30 秒、交互上限 3 次，三次按压共 10.5 秒，预算够用。
+MECH_HOLD_PRESS_TIME: float = 3.5
+# 容器类型 -> 到达该容器时返回的任务状态。导航与流程执行器都要用同一份，
+# 两边各写一份必然对不上（会表现成「明明到了却被判成没到」）。
+CONTAINER_ARRIVE_STATUS: dict[str, str] = {
+    'box': '已到武备箱',
+    'safe': '已到电子保险箱',
+    'mech': '已到机械保险箱',
+}
+# 容器类型 -> 中文名，用于操作名与提示文案。
+CONTAINER_LABELS: dict[str, str] = {
+    'box': '武备箱',
+    'safe': '电子保险箱',
+    'mech': '机械保险箱',
+}
+
 # 仓库清理：default 按下面的两步出售；custom 按 clean_steps 顺序出售。
 CLEAN_MODE_DEFAULT: str = 'default'
 CLEAN_MODE_CUSTOM: str = 'custom'

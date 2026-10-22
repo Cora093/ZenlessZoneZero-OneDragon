@@ -13,6 +13,7 @@ import yaml
 
 from one_dragon.utils import os_utils
 from zzz_od.application.bagel.bagel_const import (
+    CONTAINER_TITLE_AREAS,
     NAV_CRUISE_DISTANCE,
     NAV_SAFE_BRAKE_DISTANCE,
 )
@@ -238,7 +239,7 @@ class BagelFlow:
             if plain_move and 'target' in value:
                 raise ValueError('普通移动不接受目标参数')
             if action not in ('spawn', 'exit') and not plain_move:
-                if target not in ('box', 'safe'):
+                if target not in CONTAINER_TITLE_AREAS:
                     raise ValueError('该动作须指定容器类型')
             elif target is not None:
                 raise ValueError('该动作不接受目标参数')
@@ -418,7 +419,7 @@ class BagelFlow:
                 raise ValueError(f'未知业务动作：{action}')
             target = value.get('target')
             if action in ('move', 'store'):
-                if target not in ('box', 'safe'):
+                if target not in CONTAINER_TITLE_AREAS:
                     raise ValueError('移动或收集须指定容器类型')
             elif target is not None:
                 raise ValueError('该动作不接受目标参数')
