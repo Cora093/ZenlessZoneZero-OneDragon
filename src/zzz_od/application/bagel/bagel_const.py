@@ -36,6 +36,13 @@ NAV_LOCATE_MISS_LIMIT: int = 3
 # 电子保险箱完成四轮点按后等待搜索结果，点按时机按光圈状态判断。
 SAFE_UNLOCK_HITS: int = 4
 
+# 「原地开始」：先读小地图，认得出支持出生点就直接进该路线流程，不重开。
+START_IN_PLACE_HUD_MISS_LIMIT: int = 4
+START_IN_PLACE_HUD_WAIT: float = 0.3
+# 认出的位置离出生点多远仍算「在出生点附近」。超出说明已经走远了，
+# 直接按该路线跑会从错误位置起步，不如照常重开。
+START_IN_PLACE_SPAWN_RADIUS: float = 12.0
+
 # 仓库清理：default 用下面的固定组合；custom 按 clean_steps 顺序，每步用该步的类型和品质。
 CLEAN_MODE_DEFAULT: str = 'default'
 CLEAN_MODE_CUSTOM: str = 'custom'

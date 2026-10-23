@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import hypot
 from typing import TYPE_CHECKING
 
 import cv2
@@ -42,6 +43,11 @@ class BagelApp(ZApplication):
     STATUS_SKIP: str = '非支持出生点，退出重开'
     STATUS_A: str = '录像店复活点，开始收集'
     STATUS_B: str = '白鸽工地地铁站复活点，开始收集'
+    # 底图标识 -> (状态名, 出生点名称)。原地开始与正常入场共用这一张表。
+    SPAWN_STATUS: dict[str, tuple[str, str]] = {
+        'janus_high_a': (STATUS_A, '录像店复活点'),
+        'janus_high_b': (STATUS_B, '白鸽工地地铁站复活点'),
+    }
 
     def __init__(
         self, ctx: ZContext, config: BagelConfig, record: BagelRunRecord,
@@ -157,7 +163,63 @@ class BagelApp(ZApplication):
         except (OSError, ValueError) as error:
             return self.round_fail(f'贝果配置无效：{error}')
         bagel_usage.log_start(self.config)
+        if self.config.start_in_place:
+            started = self._try_start_in_place()
+            if started is not None:
+                return started
         return self.round_success()
+
+    def _try_start_in_place(self) -> OperationRoundResult | None:
+        """已在某个支持出生点附近时直接进该路线，不重开；不适用时返回 None。
+
+        开启 `start_in_place` 后，站在已支持路线的出生点附近即可直接开始那条路线，
+        避免反复重开被随机到别的地图。判定放在「检查贝果运行条件」末尾 ——
+        那是本次任务的唯一出口，不会与「零携带入场」的既有出边产生歧义。
+        """
+        self.screenshot()
+        if is_bagel_result(self):
+            return None
+        if not self.round_by_find_area(
+            self.last_screenshot, '战斗画面', '按键-普通攻击',
+        ).is_success:
+            self._spawn_hud_misses += 1
+            if self._spawn_hud_misses < bagel_const.START_IN_PLACE_HUD_MISS_LIMIT:
+                return self.round_wait(
+                    f'局内 HUD 暂未识别（{self._spawn_hud_misses}/'
+                    f'{bagel_const.START_IN_PLACE_HUD_MISS_LIMIT}），再看一帧',
+                    wait=bagel_const.START_IN_PLACE_HUD_WAIT,
+                )
+            log.info('原地开始：未识别到局内画面，照常零携带入场')
+            return None
+        self._spawn_hud_misses = 0
+        area = self.ctx.screen_loader.get_area('贝果-局内', '定位小地图')
+        if area is None:
+            return self.round_fail('缺少贝果定位小地图区域')
+        crop = cv2_utils.crop_image_only(self.last_screenshot, area.pc_rect)
+        crop = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+        map_id = self._spawn_matcher().match(crop)
+        spawn_status = self.SPAWN_STATUS.get(map_id) if map_id is not None else None
+        if spawn_status is None:
+            log.info('原地开始：当前小地图认不出支持出生点，照常零携带入场')
+            return None
+        # 认出了地图，还要确认玩家确实站在出生点附近：走远了直接跑该路线会从
+        # 错误位置起步，比重开更糟。
+        vision = self._spawn_matcher().vision(map_id)
+        location = vision.last_location
+        if location is None or location.position is None:
+            log.info('原地开始：认出%s但取不到坐标，照常零携带入场', spawn_status[1])
+            return None
+        distance = hypot(location.position[0] - vision.spawn[0], location.position[1] - vision.spawn[1])
+        if distance > bagel_const.START_IN_PLACE_SPAWN_RADIUS:
+            log.info(
+                '原地开始：认出%s但离出生点 %.1f 格（上限 %.1f），照常零携带入场',
+                spawn_status[1], distance, bagel_const.START_IN_PLACE_SPAWN_RADIUS,
+            )
+            return None
+        self.matched_map_id = map_id
+        self.attempts += 1
+        log.info('原地开始：已在%s附近（距出生点 %.1f 格），直接开始收集', spawn_status[1], distance)
+        return self.round_success(spawn_status[0])
 
     @node_from(from_name='检查贝果运行条件')
     @node_from(from_name='返回入口')
@@ -248,6 +310,10 @@ class BagelApp(ZApplication):
 
     @node_from(from_name='识别出生点', status=STATUS_A)
     @node_from(from_name='识别出生点', status=STATUS_B)
+    # 原地开始直接在「检查贝果运行条件」返回同样的状态，不经过识别出生点。
+    # 缺这两条时状态匹配会退化到 status=None 那条边，被送进零携带入场。
+    @node_from(from_name='检查贝果运行条件', status=STATUS_A)
+    @node_from(from_name='检查贝果运行条件', status=STATUS_B)
     @operation_node(name='执行局内流程', screenshot_before_round=False)
     def run_flow(self) -> OperationRoundResult:
         """按出生地执行发布流程；与开发工具共用同一执行器。"""

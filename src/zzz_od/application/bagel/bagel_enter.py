@@ -192,11 +192,12 @@ class BagelEnter(BagelOperation):
         at_prepare = self._has('预设组合', '贝果-备战')
         at_map = self._has('前往备战', '贝果-选图')
         at_hub = all(self._has(name, '贝果-研究站') for name in ('标题', '前往空洞'))
-        if not self.prepare_shortcut_entry:
-            if at_prepare:
-                return self.round_success('已在备战')
-            if at_map or at_hub:
-                return self.round_success()
+        # 无论是否首次入场，只要已在贝果界面就直接继续，避免不必要的传送。
+        # 原地开始（keep_started_round）后第一局结束时就在选图界面，不应重新传送。
+        if at_prepare:
+            return self.round_success('已在备战')
+        if at_map or at_hub:
+            return self.round_success()
         at_dialog = all(self._has(name, '贝果-研究站') for name in ('对话人', '出发对话'))
         if self._at_bagel_activity():
             # 活动页也有「前往空洞」，点它进入选图页，不能停在这里。
