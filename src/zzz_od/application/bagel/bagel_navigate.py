@@ -12,6 +12,9 @@ from one_dragon.base.operation.operation_node import operation_node
 from one_dragon.utils import cal_utils, cv2_utils
 from one_dragon.utils.log_utils import log
 from zzz_od.application.bagel.bagel_const import (
+    CONTAINER_ARRIVE_STATUS,
+    CONTAINER_LABELS,
+    CONTAINER_PROMPT_AREAS,
     NAV_ALIGN_PRESS,
     NAV_CRUISE_DISTANCE,
     NAV_CRUISE_TURN_CAP,
@@ -33,7 +36,7 @@ from zzz_od.application.bagel.bagel_operation import (
     BagelOperation,
     BagelRecoverableFailure,
 )
-from zzz_od.application.bagel.bagel_route import BagelRoute
+from zzz_od.application.bagel.bagel_route import MAP_LABELS, BagelRoute
 from zzz_od.application.bagel.bagel_route_vision import BagelRouteVision
 from zzz_od.operation.turning.turn_compensation import AngleTurnCompensator
 
@@ -47,7 +50,7 @@ if TYPE_CHECKING:
     from zzz_od.application.bagel.bagel_fixed_map import BagelFixedMap
     from zzz_od.context.zzz_context import ZContext
 
-Destination = Literal['box', 'safe', 'move']
+Destination = Literal['box', 'safe', 'mech', 'move']
 
 
 class BagelNavigate(BagelOperation):
@@ -76,15 +79,15 @@ class BagelNavigate(BagelOperation):
         on_location_wait: Callable[[], None] | None = None,
     ) -> None:
         """普通移动使用独立坐标；只有靠近容器才需要目标类型。"""
-        if destination not in ('box', 'safe', 'move'):
-            raise ValueError('导航目标只能是 move、box 或 safe')
+        if destination not in ('box', 'safe', 'mech', 'move'):
+            raise ValueError('导航目标只能是 move、box、safe或 mech')
         if destination == 'move' and (route_data is None or not coordinate_only):
             raise ValueError('普通移动必须提供独立路点并按坐标完成')
-        route_label = '录像店复活点' if map_id == 'janus_high_a' else '白鸽工地地铁站复活点'
+        route_label = MAP_LABELS.get(map_id, map_id)
         name = (
             f'贝果-{route_label}前往武备箱'
             if destination == 'box'
-            else '贝果-前往电子保险箱'
+            else f'贝果-前往{CONTAINER_LABELS.get(destination, "电子保险箱")}'
         )
         if destination == 'move':
             name = '贝果-移动到路点'
@@ -123,11 +126,11 @@ class BagelNavigate(BagelOperation):
         if not self.vision.route.points_for(destination):
             raise ValueError(f'{map_id} 暂不支持该导航路段：{destination}')
         self.active_waypoints: list[tuple[str, tuple[float, float]]] = self._select_waypoints()
-        self.interact_area: str = '武备箱交互' if destination == 'box' else '电子保险箱交互'
-        self.forward_press: float = NAV_FORWARD_PRESS
-        self.arrive_status: str = (
-            self.STATUS_ARRIVED_BOX if destination == 'box' else self.STATUS_ARRIVED_SAFE
+        self.interact_area: str = CONTAINER_PROMPT_AREAS.get(destination, '')
+        self.arrive_status: str = CONTAINER_ARRIVE_STATUS.get(
+            destination, self.STATUS_ARRIVED_SAFE,
         )
+        self.forward_press: float = NAV_FORWARD_PRESS
         self.waypoint_index: int = 0
         self.steps: int = 0
         self.heading_aligned: bool = False
@@ -342,7 +345,7 @@ class BagelNavigate(BagelOperation):
                 self._invalidate_heading()
         if self.target_wait_started is not None:
             return self._wait_for_interaction()
-        if self.destination in ('safe', 'move') and self._cruise_progress is not None:
+        if self.destination in ('safe', 'mech', 'move') and self._cruise_progress is not None:
             previous, started = self._cruise_progress
             if hypot(position[0] - previous[0], position[1] - previous[1]) >= 2:
                 self._cruise_progress = (position, self.last_screenshot_time)
@@ -555,7 +558,7 @@ class BagelNavigate(BagelOperation):
             self.last_screenshot, '贝果-局内', '交互F键',
         ).is_success:
             return False
-        for area_name in ('武备箱交互', '电子保险箱交互'):
+        for area_name in CONTAINER_PROMPT_AREAS.values():
             if self.round_by_find_area(
                 self.last_screenshot, '贝果-局内', area_name,
             ).is_success:

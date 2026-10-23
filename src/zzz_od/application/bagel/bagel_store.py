@@ -7,6 +7,7 @@ from one_dragon.base.geometry.point import Point
 from one_dragon.base.operation.operation_edge import node_from
 from one_dragon.base.operation.operation_node import operation_node
 from one_dragon.utils.log_utils import log
+from zzz_od.application.bagel.bagel_const import CONTAINER_TITLE_AREAS
 from zzz_od.application.bagel.bagel_item_vision import (
     ACTION_FILL,
     ACTION_SWAP,
@@ -179,14 +180,12 @@ class BagelStoreSafe(BagelOperation):
         return self._give_up('安全箱格子状态不明')
 
     def _search_ready(self) -> bool:
-        """搜查面板与安全箱同时可见才允许拖拽；武备箱与电子保险箱标题均可。"""
-        title_ok = (
+        """搜查面板与安全箱同时可见才允许拖拽；三种容器的标题都算。"""
+        title_ok = any(
             self.round_by_find_area(
-                self.last_screenshot, '贝果-局内', '搜查容器标题',
+                self.last_screenshot, '贝果-局内', area,
             ).is_success
-            or self.round_by_find_area(
-                self.last_screenshot, '贝果-局内', '电子保险箱标题',
-            ).is_success
+            for area in CONTAINER_TITLE_AREAS.values()
         )
         return title_ok and self.round_by_find_area(
             self.last_screenshot, '贝果-局内', '搜查安全箱',
@@ -504,12 +503,10 @@ class BagelStoreSafe(BagelOperation):
         return transfer_visually_ok(before, after, source, destination)
 
     def _has_search_title(self) -> bool:
-        """武备箱或电子保险箱标题任一可见即仍在搜查面板。"""
-        return (
+        """三种容器的标题任一可见即仍在搜查面板。"""
+        return any(
             self.round_by_find_area(
-                self.last_screenshot, '贝果-局内', '搜查容器标题',
+                self.last_screenshot, '贝果-局内', area,
             ).is_success
-            or self.round_by_find_area(
-                self.last_screenshot, '贝果-局内', '电子保险箱标题',
-            ).is_success
+            for area in CONTAINER_TITLE_AREAS.values()
         )
