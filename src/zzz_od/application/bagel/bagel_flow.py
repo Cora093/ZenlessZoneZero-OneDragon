@@ -71,6 +71,13 @@ class NavigationOptions:
     brake_distance: float | None = None
     final_mode: str | None = None
     interaction_distance: float | None = None
+    arrive_heading: float | None = None
+    arrive_heading_to_next: bool = False
+
+    @property
+    def uses_arrive_heading(self) -> bool:
+        """该步骤到达后是否需要闭环转向镜头。"""
+        return self.arrive_heading is not None or self.arrive_heading_to_next
 
     @property
     def effective_interaction_distance(self) -> float:
@@ -104,7 +111,7 @@ class NavigationOptions:
 
     def to_dict(self) -> dict[str, Any]:
         """默认项不复制到文件中。"""
-        return {
+        data = {
             key: value
             for key, value in (
                 ('timeout', self.timeout),
@@ -114,6 +121,13 @@ class NavigationOptions:
             )
             if value is not None
         }
+        # 「转向下一路点」时角度由程序按坐标算，占位值不写回，
+        # 否则 from_dict 会以「角度与下一路点不能并存」拒绝读回。
+        if self.arrive_heading_to_next:
+            data['arrive_heading_to_next'] = True
+        elif self.arrive_heading is not None:
+            data['arrive_heading'] = self.arrive_heading
+        return data
 
     @classmethod
     def from_dict(cls, data: object) -> NavigationOptions:
@@ -123,6 +137,8 @@ class NavigationOptions:
             'brake_distance',
             'final_mode',
             'interaction_distance',
+            'arrive_heading',
+            'arrive_heading_to_next',
         }:
             raise ValueError('导航参数包含未知字段')
         timeout = (
@@ -141,7 +157,21 @@ class NavigationOptions:
             if 'interaction_distance' in data
             else None
         )
-        return cls(timeout, brake, mode, interaction)
+        to_next = data.get('arrive_heading_to_next', False)
+        if not isinstance(to_next, bool):
+            raise ValueError('到达转向的朝向来源必须是真假值')
+        arrive_heading = (
+            _number(data['arrive_heading'], '到达转向角度', -360.0, 360.0)
+            if 'arrive_heading' in data
+            else None
+        )
+        if arrive_heading is not None and to_next:
+            raise ValueError('到达转向不能同时指定角度和转向下一路点')
+        return cls(
+            timeout, brake, mode, interaction,
+            # 转向下一路点时角度由程序按坐标算，这里先占位。
+            0.0 if to_next else arrive_heading, to_next,
+        )
 
 
 @dataclass(frozen=True)
