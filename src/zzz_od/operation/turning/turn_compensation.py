@@ -18,6 +18,7 @@ class AngleTurnCompensator:
         # 记录上一轮转向样本，等下一帧拿到新朝向后再学习
         self.last_source_angle: float | None = None
         self.last_effective_angle_diff: float | None = None
+        self.last_max_abs: float | None = None
 
     def reset(self) -> None:
         """清空补偿比例和上一轮转向样本。"""
@@ -28,6 +29,7 @@ class AngleTurnCompensator:
         """清空上一轮尚未学习的转向样本，保留补偿比例。"""
         self.last_source_angle = None
         self.last_effective_angle_diff = None
+        self.last_max_abs = None
 
     def learn(self, source_angle: float, effective_angle_diff: float, current_angle: float) -> None:
         """用转向前后的朝向变化更新运行期补偿比例。"""
@@ -47,12 +49,21 @@ class AngleTurnCompensator:
         clipped_change = max(-self._MAX_SCALE_CHANGE, min(scale_change, self._MAX_SCALE_CHANGE))
         self.scale = max(self._MIN_SCALE, min(self.scale + clipped_change, self._MAX_SCALE))
 
-    def turn_from_angle(self, source_angle: float, angle_diff: float) -> float:
-        """用当前朝向学习上一轮，再下发本轮转向并记录样本。"""
+    def turn_from_angle(self, source_angle: float, angle_diff: float, max_abs_angle_diff: float | None = None) -> float:
+        """用当前朝向学习上一轮，再下发本轮转向并记录样本。
+
+        如果上一轮转向被 cap 了（达到 max_abs 上限），跳过学习以避免错误的 scale 调整。
+        """
         if self.last_source_angle is not None and self.last_effective_angle_diff is not None:
-            self.learn(self.last_source_angle, self.last_effective_angle_diff, source_angle)
+            was_capped = (
+                self.last_max_abs is not None
+                and abs(self.last_effective_angle_diff) >= self.last_max_abs - self._ANGLE_EPSILON
+            )
+            if not was_capped:
+                self.learn(self.last_source_angle, self.last_effective_angle_diff, source_angle)
         self.last_source_angle = source_angle
-        self.last_effective_angle_diff = self.turn(angle_diff)
+        self.last_max_abs = max_abs_angle_diff
+        self.last_effective_angle_diff = self.turn(angle_diff, max_abs_angle_diff)
         return self.last_effective_angle_diff
 
     def turn(self, angle_diff: float, max_abs_angle_diff: float | None = None) -> float:

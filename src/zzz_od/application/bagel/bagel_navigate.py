@@ -12,12 +12,20 @@ from one_dragon.base.operation.operation_node import operation_node
 from one_dragon.utils import cal_utils, cv2_utils
 from one_dragon.utils.log_utils import log
 from zzz_od.application.bagel.bagel_const import (
+    CONTAINER_ARRIVE_STATUS,
+    CONTAINER_LABELS,
+    CONTAINER_PROMPT_AREAS,
     NAV_ALIGN_PRESS,
+    NAV_ARRIVE_TURN_CAP,
+    NAV_ARRIVE_TURN_DEADBAND,
+    NAV_ARRIVE_TURN_MAX_ROUNDS,
     NAV_CRUISE_DISTANCE,
     NAV_CRUISE_TURN_CAP,
     NAV_CRUISE_TURN_GAP,
     NAV_CRUISE_TURN_LIMIT,
     NAV_FORWARD_PRESS,
+    NAV_HOOK_HEADING_MISS_LIMIT,
+    NAV_HOOK_STEP_WAIT,
     NAV_INITIAL_LOCATE_MISS_LIMIT,
     NAV_INITIAL_LOCATE_WAIT,
     NAV_LOCATE_MISS_LIMIT,
@@ -33,7 +41,7 @@ from zzz_od.application.bagel.bagel_operation import (
     BagelOperation,
     BagelRecoverableFailure,
 )
-from zzz_od.application.bagel.bagel_route import BagelRoute
+from zzz_od.application.bagel.bagel_route import MAP_LABELS, BagelRoute
 from zzz_od.application.bagel.bagel_route_vision import BagelRouteVision
 from zzz_od.operation.turning.turn_compensation import AngleTurnCompensator
 
@@ -47,7 +55,7 @@ if TYPE_CHECKING:
     from zzz_od.application.bagel.bagel_fixed_map import BagelFixedMap
     from zzz_od.context.zzz_context import ZContext
 
-Destination = Literal['box', 'safe', 'move']
+Destination = Literal['box', 'safe', 'mech', 'move']
 
 
 class BagelNavigate(BagelOperation):
@@ -74,17 +82,18 @@ class BagelNavigate(BagelOperation):
         recovery: ContainerRecovery | None = None,
         recovering: bool = False,
         on_location_wait: Callable[[], None] | None = None,
+        next_waypoint_xy: tuple[float, float] | None = None,
     ) -> None:
         """普通移动使用独立坐标；只有靠近容器才需要目标类型。"""
-        if destination not in ('box', 'safe', 'move'):
-            raise ValueError('导航目标只能是 move、box 或 safe')
+        if destination not in ('box', 'safe', 'mech', 'move'):
+            raise ValueError('导航目标只能是 move、box、safe或 mech')
         if destination == 'move' and (route_data is None or not coordinate_only):
             raise ValueError('普通移动必须提供独立路点并按坐标完成')
-        route_label = '录像店复活点' if map_id == 'janus_high_a' else '白鸽工地地铁站复活点'
+        route_label = MAP_LABELS.get(map_id, map_id)
         name = (
             f'贝果-{route_label}前往武备箱'
             if destination == 'box'
-            else '贝果-前往电子保险箱'
+            else f'贝果-前往{CONTAINER_LABELS.get(destination, "电子保险箱")}'
         )
         if destination == 'move':
             name = '贝果-移动到路点'
@@ -123,16 +132,16 @@ class BagelNavigate(BagelOperation):
         if not self.vision.route.points_for(destination):
             raise ValueError(f'{map_id} 暂不支持该导航路段：{destination}')
         self.active_waypoints: list[tuple[str, tuple[float, float]]] = self._select_waypoints()
-        self.interact_area: str = '武备箱交互' if destination == 'box' else '电子保险箱交互'
-        self.forward_press: float = NAV_FORWARD_PRESS
-        self.arrive_status: str = (
-            self.STATUS_ARRIVED_BOX if destination == 'box' else self.STATUS_ARRIVED_SAFE
+        self.interact_area: str = CONTAINER_PROMPT_AREAS.get(destination, '')
+        self.arrive_status: str = CONTAINER_ARRIVE_STATUS.get(
+            destination, self.STATUS_ARRIVED_SAFE,
         )
+        self.forward_press: float = NAV_FORWARD_PRESS
         self.waypoint_index: int = 0
         self.steps: int = 0
         self.heading_aligned: bool = False
         self.last_input_frame: float | None = None
-        self.pending_turn: tuple[float, float] | None = None
+        self.pending_turn: tuple[float, float, bool] | None = None
         self.turn_compensator: AngleTurnCompensator = AngleTurnCompensator(ctx.controller)
         self.target_wait_started: float | None = None
         self.locate_misses: int = 0
@@ -140,6 +149,22 @@ class BagelNavigate(BagelOperation):
         self.last_position: tuple[float, float] | None = None
         self._cruise_progress: tuple[tuple[float, float], float] | None = None
         self.last_cruise_turn_at: float | None = None
+        # 到达后闭环转向：非 None 表示正在转向这个角度；misses 是连续读不到
+        # 角色箭头的轮数，到上限就放弃转向按计时走完。
+        self._arrive_heading: float | None = None
+        self._arrive_heading_misses: int = 0
+        # 到达后转向已经补了几轮；一直不到位就放弃，不能原地打转。
+        self._arrive_heading_rounds: int = 0
+        # 到达后转向上一轮的指令，用于速率限制防止振荡。
+        self._arrive_heading_last_command: float = 0.0
+        # 到达后位移：按住哪些移动键、还剩多少秒。
+        self._held_move_keys: tuple[str, ...] = ()
+        self._arrive_move_keys: tuple[str, ...] = ()
+        self._arrive_move_left: float | None = None
+        # 已经点过冲刺的路点序号；每个路点只点一次，换段才允许再点。
+        self._sprint_waypoint_index: int | None = None
+        # cruise_only 模式下监控距离：记录当前路点的最小距离，距离开始变大就认为到达。
+        self._cruise_min_distance: float | None = None
         self._spawn_far: int = 0
         self._spawn_miss: int = 0
         self._safe_brake_until: float | None = None
@@ -148,6 +173,9 @@ class BagelNavigate(BagelOperation):
         self.recovery: ContainerRecovery = recovery or ContainerRecovery(lambda: self.operation_usage_time)
         self.recovering: bool = recovering
         self.on_location_wait: Callable[[], None] | None = on_location_wait
+        # 本段路点走完后要去的下一个坐标。本段没有后续路点时（独立坐标段），
+        # 由流程执行器告知下一段的第一个路点；两者都没有则不转向。
+        self.next_waypoint_xy: tuple[float, float] | None = next_waypoint_xy
         self._settle_until: float | None = None
         self._settled: bool = False
 
@@ -172,6 +200,12 @@ class BagelNavigate(BagelOperation):
         self._destination_braked = False
         self._settle_until = None
         self._settled = False
+        self._arrive_heading = None
+        self._arrive_heading_misses = 0
+        self._arrive_heading_rounds = 0
+        self._release_move_keys()
+        self._arrive_move_keys = ()
+        self._arrive_move_left = None
         if self._owns_recovery:
             self.recovery = ContainerRecovery(lambda: self.operation_usage_time)
         self._invalidate_heading()
@@ -343,7 +377,7 @@ class BagelNavigate(BagelOperation):
                 self._invalidate_heading()
         if self.target_wait_started is not None:
             return self._wait_for_interaction()
-        if self.destination in ('safe', 'move') and self._cruise_progress is not None:
+        if self.destination in ('safe', 'mech', 'move') and self._cruise_progress is not None:
             previous, started = self._cruise_progress
             if hypot(position[0] - previous[0], position[1] - previous[1]) >= 2:
                 self._cruise_progress = (position, self.last_screenshot_time)
@@ -389,22 +423,66 @@ class BagelNavigate(BagelOperation):
                 self._release_forward()
                 self.heading_aligned = False
                 self.pending_turn = None
-            if self.coordinate_only:
-                self._release_forward()
-                return self.round_success(self.STATUS_WAYPOINT)
-            self.waypoint_index += 1
-            return self.round_wait('已越过中间节点，准备下一段', wait=0.1)
+            # 如果还有后续路点，继续到下一个；否则才返回完成。
+            if intermediate:
+                # 中间路点：继续到下一个路点
+                if self.coordinate_only:
+                    self._release_forward()
+                    turning = self._start_arrive_heading()
+                    if turning is not None:
+                        return turning
+                self.waypoint_index += 1
+                if self.navigation.effective_cruise_only:
+                    self._cruise_min_distance = None
+                return self.round_wait('已越过中间节点，准备下一段', wait=0.1)
+            else:
+                # 最后一个路点：返回完成
+                if self.coordinate_only:
+                    self._release_forward()
+                    turning = self._start_arrive_heading()
+                    if turning is not None:
+                        return turning
+                    return self.round_success(self.STATUS_WAYPOINT)
         arrival_radius = point.arrival_radius
-        if distance <= (min(arrival_radius, 0.5) if self.recovering else arrival_radius):
+        # cruise_only 模式下同时监控距离：记录最小距离，距离开始变大就认为到达。
+        if self.navigation.effective_cruise_only:
+            if self._cruise_min_distance is None or distance < self._cruise_min_distance:
+                self._cruise_min_distance = distance
+        arrived = distance <= (min(arrival_radius, 0.5) if self.recovering else arrival_radius)
+        if not arrived and self.navigation.effective_cruise_only and self._cruise_min_distance is not None:
+            # 兜底：距离开始变大且已经在 6 以内，认为到达。
+            if distance > self._cruise_min_distance and distance <= 6.0:
+                arrived = True
+        if arrived:
+            # cruise_only 到达时重置最小距离，为下一路点做准备。
+            if self.navigation.effective_cruise_only:
+                self._cruise_min_distance = None
             if point.stop or not intermediate:
                 self._release_forward()
-            if self.coordinate_only:
-                return self.round_success(self.STATUS_WAYPOINT)
-            if self.waypoint_index + 1 == len(self.active_waypoints):
-                self.target_wait_started = self.last_screenshot_time
-                return self._wait_for_interaction()
-            self.waypoint_index += 1
-            return self.round_wait('已到中间节点，准备下一段', wait=0.1)
+            # 如果还有后续路点，继续到下一个；否则才返回完成。
+            if intermediate:
+                # 中间路点：继续到下一个路点
+                if self.coordinate_only:
+                    # 坐标模式也需要检查是否需要转向到下一段
+                    turning = self._start_arrive_heading()
+                    if turning is not None:
+                        return turning
+                self.waypoint_index += 1
+                return self.round_wait('已到中间节点，准备下一段', wait=0.1)
+            else:
+                # 最后一个路点：返回完成
+                if self.coordinate_only:
+                    turning = self._start_arrive_heading()
+                    if turning is not None:
+                        return turning
+                    return self.round_success(self.STATUS_WAYPOINT)
+                if self.waypoint_index + 1 == len(self.active_waypoints):
+                    self.target_wait_started = self.last_screenshot_time
+                    return self._wait_for_interaction()
+        # 到达转向进行中：角色往前走会偏离目标点，但转向没完成前不能切回巡航/对齐，
+        # 否则会被普通的停车转向打断，角度读数也会跳变。
+        if self._arrive_heading is not None:
+            return self._continue_arrive_heading()
         self.target_wait_started = None
         reason = self.recovery.error() if not self.coordinate_only else None
         if reason:
@@ -446,7 +524,9 @@ class BagelNavigate(BagelOperation):
         self, image_angle: float, target_angle: float, name: str,
     ) -> OperationRoundResult:
         """距节点较远时按住前进；小偏差边走边转，大偏差停车转。"""
+        cruise_only = self.navigation.effective_cruise_only
         if not self.heading_aligned:
+            # 无论是否 cruise_only，初始朝向未对齐时都要先处理大角度
             limited = self._fail_if_action_limit()
             if limited is not None:
                 return limited
@@ -454,12 +534,14 @@ class BagelNavigate(BagelOperation):
             if self.pending_turn is not None:
                 return self._tap_align()
             controller_angle, angle_diff = self._observe_heading(image_angle, target_angle)
-            # 首次观测偏差大时先停车转向。
+            # 首次观测偏差大时，停车转向对齐后再进入巡航
             if abs(angle_diff) > NAV_CRUISE_TURN_LIMIT:
+                log.debug(f'大角度转向判定: angle_diff={angle_diff:.1f}, cruise_only={cruise_only}, heading_aligned={self.heading_aligned}')
                 return self._stop_and_turn(controller_angle, angle_diff)
             return self._tap_align()
         controller_angle, angle_diff = self._observe_heading(image_angle, target_angle)
-        if abs(angle_diff) > NAV_CRUISE_TURN_LIMIT:
+        if abs(angle_diff) > NAV_CRUISE_TURN_LIMIT and not cruise_only:
+            log.debug(f'巡航中大角度停车转向: angle_diff={angle_diff:.1f}, cruise_only={cruise_only}')
             self._cruise_progress = None
             limited = self._fail_if_action_limit()
             if limited is not None:
@@ -469,16 +551,18 @@ class BagelNavigate(BagelOperation):
             # 路边药粉等可拾取物会把镜头拉偏；不按 F，也不跟着小角度来回转。
             if self._cruise_progress is None and self.last_position is not None:
                 self._cruise_progress = (self.last_position, self.last_screenshot_time)
-            self.ctx.controller.start_moving_forward()
+            self._start_forward()
             return self.round_wait('忽略路上可拾取物')
-        if abs(angle_diff) > NAV_TURN_DEADBAND:
+        # cruise_only 模式用更小的 deadband，提高修正频率。
+        turn_deadband = 3.0 if cruise_only else NAV_TURN_DEADBAND
+        if abs(angle_diff) > turn_deadband:
             if (
                 self.last_cruise_turn_at is not None
                 and self.last_screenshot_time - self.last_cruise_turn_at < NAV_CRUISE_TURN_GAP
             ):
                 if self._cruise_progress is None and self.last_position is not None:
                     self._cruise_progress = (self.last_position, self.last_screenshot_time)
-                self.ctx.controller.start_moving_forward()
+                self._start_forward()
                 return self.round_wait(f'前往{name}')
             limited = self._fail_if_action_limit()
             if limited is not None:
@@ -486,24 +570,38 @@ class BagelNavigate(BagelOperation):
             self.last_cruise_turn_at = self.last_screenshot_time
             if self._cruise_progress is None and self.last_position is not None:
                 self._cruise_progress = (self.last_position, self.last_screenshot_time)
-            self.ctx.controller.start_moving_forward()
-            effective = self.turn_compensator.turn(angle_diff, max_abs_angle_diff=NAV_CRUISE_TURN_CAP)
-            self.pending_turn = (controller_angle, effective)
+            self._start_forward()
+            # cruise_only 模式允许更大的转向上限，快速修正大误差。
+            cruise_cap = 60.0 if cruise_only else NAV_CRUISE_TURN_CAP
+            effective = self.turn_compensator.turn(angle_diff, max_abs_angle_diff=cruise_cap)
+            was_capped = abs(effective) >= cruise_cap - 1e-6
+            self.pending_turn = (controller_angle, effective, was_capped)
             self._record_input()
-            return self.round_wait(f'行进转向 {angle_diff:.1f}度')
+            return self.round_wait(f'行进转向 {angle_diff:.1f}度(下发{effective:.1f})')
         if self._cruise_progress is None and self.last_position is not None:
             self._cruise_progress = (self.last_position, self.last_screenshot_time)
-        self.ctx.controller.start_moving_forward()
+        self._start_forward()
         return self.round_wait(f'前往{name}')
 
     def _align_to_heading(
         self, image_angle: float, target_angle: float,
     ) -> OperationRoundResult | None:
         """短步前停车对齐。偏差超过死区就停车转，转完再短按 W。"""
-        if not self.heading_aligned:
+        cruise_only = self.navigation.effective_cruise_only
+        if not self.heading_aligned and not cruise_only:
             return self._tap_align()
         controller_angle, angle_diff = self._observe_heading(image_angle, target_angle)
-        if abs(angle_diff) > NAV_TURN_DEADBAND:
+        # cruise_only 模式用更小的 deadband，提高修正频率。
+        turn_deadband = 3.0 if cruise_only else NAV_TURN_DEADBAND
+        if abs(angle_diff) > turn_deadband:
+            if cruise_only:
+                self._start_forward()
+                effective = self.turn_compensator.turn(angle_diff, max_abs_angle_diff=NAV_CRUISE_TURN_CAP)
+                was_capped = abs(effective) >= NAV_CRUISE_TURN_CAP - 1e-6
+                self.pending_turn = (controller_angle, effective, was_capped)
+                self._record_input()
+                return self.round_wait(f'行进转向 {angle_diff:.1f}度(下发{effective:.1f})')
+            log.debug(f'对齐时停车转向: angle_diff={angle_diff:.1f}, cruise_only={cruise_only}')
             return self._stop_and_turn(controller_angle, angle_diff)
         return None
 
@@ -536,7 +634,8 @@ class BagelNavigate(BagelOperation):
         """松键后转向，单次不超过停车上限。转完需重新对齐镜头。"""
         self._release_forward()
         effective = self.turn_compensator.turn(angle_diff, max_abs_angle_diff=NAV_STOP_TURN_CAP)
-        self.pending_turn = (controller_angle, effective)
+        was_capped = abs(effective) >= NAV_STOP_TURN_CAP - 1e-6
+        self.pending_turn = (controller_angle, effective, was_capped)
         self.heading_aligned = False
         self._record_input()
         return self.round_wait(f'停车转向 {angle_diff:.1f}度', wait=0.15)
@@ -545,10 +644,210 @@ class BagelNavigate(BagelOperation):
         """用新朝向学习上一拍转向，返回控制器朝向和到目标的有向偏差。"""
         controller_angle = (-image_angle) % 360
         if self.pending_turn is not None:
-            source, effective = self.pending_turn
-            self.turn_compensator.learn(source, effective, controller_angle)
+            source, effective, was_capped = self.pending_turn
+            if not was_capped:
+                self.turn_compensator.learn(source, effective, controller_angle)
             self.pending_turn = None
         return controller_angle, cal_utils.angle_delta(controller_angle, target_angle)
+
+    def _next_waypoint_xy(self) -> tuple[float, float] | None:
+        """下一路点坐标：优先本段的后续路点，其次流程里下一段的第一个路点。
+
+        独立坐标段只有一个路点，转角发生在两段之间，所以要往后看一段。
+        """
+        index = self.waypoint_index + 1
+        if index < len(self.active_waypoints):
+            return self.active_waypoints[index][1]
+        return self.next_waypoint_xy
+
+    def _next_waypoint_heading(self) -> float | None:
+        """按下一路点坐标算出应朝向的角度。
+
+        角度一律用「顺时针为正、0=东」：小地图箭头读出来的就是这个约定，
+        `turn_by_distance` 的正方向（鼠标右移＝镜头向右转＝顺时针）也是。
+        三个量同系，偏差算出来才能直接下发给转向。
+
+        这里要的是「自己指向目标」的方向：``target - position``。
+        写成相反的方向会差 180 度，转向就朝着背离目标的一侧去了。
+        """
+        target = self._next_waypoint_xy()
+        position = self.last_position
+        if target is None or position is None:
+            return None
+        return degrees(atan2(
+            target[1] - position[1], target[0] - position[0],
+        )) % 360
+
+    def _start_arrive_heading(self) -> OperationRoundResult | None:
+        """到达后执行配置的动作：先走配置的位移引导大方向，再闭环转向对齐下一途径点。
+
+        第一阶段：按住 arrive_move_keys（如 W+D）走 arrive_move_seconds 秒，引导角色朝向大方向。
+        第二阶段：松开 arrive_move_keys，只按 W 前进，同时闭环转向对齐下一途径点。
+        转向阶段只朝镜头正前方走（前进单键）：这样角色朝向与镜头朝向一致，
+        小地图箭头读到的就是镜头朝向本身，闭环才收得敛。斜着走的话角色朝向会
+        偏离镜头朝向固定角度，读数与目标角不是同一个量，转向会在两个值之间
+        来回甩 —— 实测斜向移动时读数在 181 / 25 / 288 度之间乱跳。
+        """
+        if self._arrive_heading is not None or self._arrive_move_left is not None:
+            return self._continue_arrive_heading()
+        options = self.navigation
+        self._arrive_move_keys = options.arrive_move_keys or ()
+        if options.arrive_move_keys:
+            self._arrive_move_left = options.arrive_move_seconds or 0.0
+            # 第一阶段：先走配置的位移引导大方向
+            self._hold_move_keys(self._arrive_move_keys)
+            log.info(
+                '到达后位移开始：按键 %s，持续 %.1f 秒 map=%s',
+                self._arrive_move_keys, self._arrive_move_left, self.map_id,
+            )
+            return self._continue_arrive_heading()
+        # 没有配置 arrive_move_keys，直接进入转向阶段
+        return self._start_arrive_turn()
+
+    def _start_arrive_turn(self) -> OperationRoundResult | None:
+        """开始转向阶段：计算目标角度，只按 W 前进，闭环转向。"""
+        options = self.navigation
+        if not options.uses_arrive_heading:
+            return None
+        heading = (
+            self._next_waypoint_heading()
+            if options.arrive_heading_to_next
+            else options.arrive_heading
+        )
+        if heading is None:
+            return None
+        self._arrive_heading = heading % 360
+        self._arrive_heading_misses = 0
+        self._arrive_heading_rounds = 0
+        self._arrive_heading_last_command = 0.0
+        # 转向期间只按 W，角色朝向才等于镜头朝向，转向才能生效。
+        self._release_move_keys()
+        self._hold_move_keys(('move_w',))
+        log.info(
+            '到达后转向开始：目标 %.1f 度，只按 W 前进 map=%s',
+            self._arrive_heading, self.map_id,
+        )
+        return self._continue_arrive_heading()
+
+    def _continue_arrive_heading(self) -> OperationRoundResult:
+        """到达后动作的三阶段：先走配置位移，再原地闭环转向，最后继续前进。
+
+        第一阶段：按住 arrive_move_keys 走 arrive_move_seconds 秒，引导大方向。
+        第二阶段：松开所有移动键，原地闭环转向对齐下一途径点。
+        第三阶段：转向完成，继续走向下一途径点。
+        读不到箭头或补满轮数就放弃转向，但位移照走完。
+        """
+        # 第一阶段：走配置的位移
+        if self._arrive_move_left is not None:
+            self._arrive_move_left -= NAV_HOOK_STEP_WAIT
+            if self._arrive_move_left > 0:
+                return self.round_wait(
+                    f'到达后位移 剩 {self._arrive_move_left:.1f} 秒', wait=NAV_HOOK_STEP_WAIT,
+                )
+            # 位移走完，进入转向阶段
+            self._arrive_move_left = None
+            return self._start_arrive_turn() or self._finish_arrive_heading()
+        # 第二阶段：闭环转向
+        if self._arrive_heading is not None:
+            result = self._turn_to_arrive_heading()
+            if result is not None:
+                return result
+            # 转向完成，进入第三阶段
+            return self._finish_arrive_heading()
+        # 没有转向阶段，直接完成
+        return self._finish_arrive_heading()
+
+    def _finish_arrive_heading(self) -> OperationRoundResult:
+        """到达后动作完成：松开所有键，返回成功。"""
+        self._release_move_keys()
+        log.info('到达后动作完成 map=%s', self.map_id)
+        return self.round_success(self.STATUS_WAYPOINT)
+
+    def _turn_to_arrive_heading(self) -> OperationRoundResult | None:
+        """一轮闭环转向；返回 None 表示转向已完成（或已放弃）。"""
+        assert self._arrive_heading is not None
+        image_angle = self.vision.player_angle(self.minimap())
+        if image_angle is None:
+            self._arrive_heading_misses += 1
+            if self._arrive_heading_misses >= NAV_HOOK_HEADING_MISS_LIMIT:
+                log.info(
+                    '到达后转向放弃：连续 %d 帧读不到角色箭头 map=%s',
+                    self._arrive_heading_misses, self.map_id,
+                )
+                self._arrive_heading = None
+                return None
+            return self.round_wait(
+                f'到达后转向中 {self._arrive_heading:.0f} 度，等角色箭头',
+                wait=NAV_HOOK_STEP_WAIT,
+            )
+        self._arrive_heading_misses = 0
+        # 角度一律顺时针为正，与箭头读数、转向下发的正方向一致。
+        # 上游的 `_observe_heading` 把角度取负成逆时针正，是给巡航那套
+        # 混用坐标系用的；到达转向自己算，不共用它。
+        controller_angle = image_angle % 360
+        angle_diff = cal_utils.angle_delta(controller_angle, self._arrive_heading)
+        if self.pending_turn is not None:
+            source, effective, was_capped = self.pending_turn
+            if not was_capped:
+                self.turn_compensator.learn(source, effective, controller_angle)
+            self.pending_turn = None
+        self._arrive_heading_rounds += 1
+        log.debug(
+            '到达后转向：目标 %.1f 度，读到 %.1f 度，偏差 %.1f 度，第 %d 轮，补偿比例 %.2f',
+            self._arrive_heading, controller_angle, angle_diff,
+            self._arrive_heading_rounds, self.turn_compensator.scale,
+        )
+        if abs(angle_diff) <= NAV_ARRIVE_TURN_DEADBAND:
+            self._arrive_heading = None
+            return None
+        if self._arrive_heading_rounds > NAV_ARRIVE_TURN_MAX_ROUNDS:
+            # 读到的角度一直不变（角色被卡住、面板挡住箭头等）时不能死磕，
+            # 放弃转向按原逻辑走完，比把整条路线卡在这里强。
+            log.info(
+                '到达后转向放弃：补了 %d 轮仍未到位 map=%s',
+                self._arrive_heading_rounds, self.map_id,
+            )
+            self._arrive_heading = None
+            return None
+        # angle_diff 是顺时针为正，但控制器期望逆时针为正，需要取反
+        desired = self.turn_compensator.turn(-angle_diff, max_abs_angle_diff=NAV_ARRIVE_TURN_CAP)
+        # 速率限制：限制每轮指令的最大变化量，防止剧烈跳变导致振荡。
+        # cruise_only 模式允许更大的变化率（60°/轮），加快收敛。
+        last_cmd = self._arrive_heading_last_command
+        max_delta = 60.0 if self.navigation.effective_cruise_only else 30.0
+        delta = desired - last_cmd
+        if abs(delta) > max_delta:
+            delta = max_delta if delta > 0 else -max_delta
+        effective = last_cmd + delta
+        self._arrive_heading_last_command = effective
+        was_capped = abs(desired) >= NAV_ARRIVE_TURN_CAP - 1e-6
+        self.pending_turn = (controller_angle, effective, was_capped)
+        self._record_input()
+        log.debug(
+            '到达后转向下发：偏差 %.1f 度，下发 %.1f 度，补偿比例 %.2f',
+            angle_diff, effective, self.turn_compensator.scale,
+        )
+        return self.round_wait(
+            f'到达后转向中 {self._arrive_heading:.0f} 度', wait=NAV_HOOK_STEP_WAIT,
+        )
+
+    def _hold_move_keys(self, keys: tuple[str, ...]) -> None:
+        """按住移动键并保持，直到显式松开。
+
+        控制器没有「保持」接口，但 `btn_press` 不带时长就只记下按住状态。
+        重复调用是幂等的，所以每轮补一次即可，靠 `_release_move_keys` 收尾。
+        """
+        for key in keys:
+            getattr(self.ctx.controller, key)(press=True)
+        self._held_move_keys = keys
+
+    def _release_move_keys(self) -> None:
+        """松开 `_hold_move_keys` 按住的全部键。"""
+        if not self._held_move_keys:
+            return
+        for key in reversed(self._held_move_keys):
+            getattr(self.ctx.controller, key)(release=True)
+        self._held_move_keys = ()
 
     def _ignoring_pickup(self) -> bool:
         """右侧出现 F 提示，且不是武备箱或电子保险箱。药粉等可拾取物直接忽略。"""
@@ -556,7 +855,7 @@ class BagelNavigate(BagelOperation):
             self.last_screenshot, '贝果-局内', '交互F键',
         ).is_success:
             return False
-        for area_name in ('武备箱交互', '电子保险箱交互'):
+        for area_name in CONTAINER_PROMPT_AREAS.values():
             if self.round_by_find_area(
                 self.last_screenshot, '贝果-局内', area_name,
             ).is_success:
@@ -577,10 +876,32 @@ class BagelNavigate(BagelOperation):
         self._release_forward()
         return self.round_recoverable_fail('导航达到动作上限')
 
+    def _start_forward(self) -> None:
+        """长按前进，并在本路点第一次起按时顺带点一下冲刺。
+
+        冲刺键与闪避共用，本流程不按闪避所以可以开。一次点按后游戏会保持冲刺
+        状态，所以每个路点点一次就够：转向、停车转向、重新起步都会反复调这里，
+        补按冲刺会让惯性一路累积把角色冲出目标（实测 2026-10-11 有一次把西南
+        转角冲出目标 9.9 格，落点方向整个反掉，下一路点直接卡死）。
+        """
+        self.ctx.controller.start_moving_forward()
+        if not self.navigation.effective_sprint:
+            return
+        if self._sprint_waypoint_index == self.waypoint_index:
+            return
+        self.ctx.controller.start_sprinting_forward()
+        self._sprint_waypoint_index = self.waypoint_index
+        log.info(
+            '贝果导航已点冲刺键 map=%s stage=%s waypoint=%s',
+            self.map_id, self.destination, self.waypoint_index,
+        )
+
     def _release_forward(self) -> None:
         """松开前进键。重复调用是安全的。"""
         self._cruise_progress = None
         self.ctx.controller.stop_moving_forward()
+        # 换段或停车后允许下一个路点重新点一次冲刺。
+        self._sprint_waypoint_index = None
 
     def _record_input(self) -> None:
         """校准、转向和短步计数，并拒绝复用动作前截图。按住观察不计。"""

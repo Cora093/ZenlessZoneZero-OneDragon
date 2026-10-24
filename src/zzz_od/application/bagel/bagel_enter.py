@@ -46,6 +46,7 @@ class BagelEnter(BagelOperation):
         allow_world_recovery: bool = False, prepare_shortcut_entry: bool = False,
         recovery_auto_clean: bool = False, recovery_filter_areas: tuple[str, ...] | None = None,
         recovery_filter_groups: tuple[tuple[str, ...], ...] | None = None,
+        keep_started_round: bool = False,
     ) -> None:
         """正式应用首次入场允许清空并重建快捷手册入口；独立工具默认复用现有贝果页。"""
         super().__init__(ctx, op_name='贝果-零携带入场', timeout_seconds=660 if allow_clear_loadout else 240)
@@ -56,6 +57,8 @@ class BagelEnter(BagelOperation):
             else DEFAULT_CLEAN_FILTER_GROUPS
         )
         self.allow_clear_loadout: bool = allow_clear_loadout
+        # 原地开始已确认「玩家就站在这一局里」，此时不该把这一局当遗留局退出。
+        self.keep_started_round: bool = keep_started_round
         self.allow_world_recovery: bool = allow_world_recovery
         self.prepare_shortcut_entry: bool = prepare_shortcut_entry
         self.world_recovery_attempted: bool = False
@@ -110,6 +113,10 @@ class BagelEnter(BagelOperation):
     def recover_start(self) -> OperationRoundResult:
         """只在首次入场恢复遗留局，按当前画面正常退出。"""
         if not self.allow_clear_loadout:
+            return self.round_success()
+        if self.keep_started_round:
+            # 原地开始已经接管当前这一局：不退出遗留局，也不清背包，直接往下走。
+            log.info('贝果启动恢复：原地开始接管当前局，保留现场不清包')
             return self.round_success()
         if (self.is_bagel_result() or self._has('提示', '贝果-退出确认')
                 or self._has('标题', '贝果-拟态单质提示')):
