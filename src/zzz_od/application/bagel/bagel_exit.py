@@ -18,6 +18,8 @@ class BagelExit(BagelOperation):
     def __init__(self, ctx: ZContext) -> None:
         """创建有界退出流程，不自动出售或返回研究站。"""
         super().__init__(ctx, op_name='贝果-退出到仓库', timeout_seconds=120)
+        self.panel_close_tries: int = 0
+        """局内面板连关失败了几次，用来轮换「点搜查返回」和「按 ESC」。"""
 
     def _at_settle_warehouse(self) -> bool:
         """结算仓库的两个按钮都在才算到仓库，避免过渡画面误判。"""
@@ -26,7 +28,21 @@ class BagelExit(BagelOperation):
             for area in ('放入仓库', '返回研究站')
         )
 
-    @operation_node(name='打开贝果暂停菜单', is_start_node=True, timeout_seconds=15)
+    def _panel_open(self) -> bool:
+        """局内还挂着搜查/解锁面板。
+
+        「全部拾取」只在搜查面板打开时出现；有些箱子（未标记的）标题是
+        「搜索物资」，不匹配搜查容器标题，只看标题会漏判，导致退出节点
+        一直报「未识别贝果局内画面」并把整个任务停掉。
+        """
+        return any(
+            self._has(area) for area in (
+                '搜查容器标题', '电子保险箱标题', '大保险解锁提示',
+                '全部拾取_单行', '全部拾取_双行',
+            )
+        )
+
+    @operation_node(name='打开贝果暂停菜单', is_start_node=True, timeout_seconds=30)
     def open_menu(self) -> OperationRoundResult:
         """由调用方确认贝果流程；普通攻击按钮出现后打开菜单，再核对专用退出提示。"""
         if self._has('标题', '贝果-拟态单质提示'):
@@ -39,9 +55,13 @@ class BagelExit(BagelOperation):
             return self.round_success('已到暂停菜单')
         if self.is_bagel_result():
             return self.round_success('已到贝果结算')
-        if any(self._has(area) for area in ('搜查容器标题', '电子保险箱标题', '大保险解锁提示')):
+        if self._panel_open():
+            self.panel_close_tries += 1
+            if self.panel_close_tries % 2 == 1:
+                self.round_by_click_area('贝果-局内', '搜查返回')
+                return self.round_wait('点击搜查返回关闭局内面板', wait=0.6)
             self.ctx.controller.btn_press('esc', press_time=0.1)
-            return self.round_wait('关闭局内面板后重新检查退出画面', wait=0.5)
+            return self.round_wait('ESC 关闭局内面板', wait=0.6)
         if self.round_by_find_area(self.last_screenshot, '战斗画面', '按键-普通攻击').is_success:
             self.ctx.controller.btn_press('esc', press_time=0.1)
             return self.round_success(wait=1)

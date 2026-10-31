@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import atexit
 import math
 import threading
 import time
@@ -47,6 +48,35 @@ RELEASE_INTERACT: str = 'release_interact'
 
 DODGE: str = 'dodge'
 """点一下闪避，用于维持冲刺。"""
+
+
+_EXIT_HOOK_REGISTERED: bool = False
+"""进程退出兜底是否已注册；只注册一次。"""
+
+
+def release_all_keys(controller) -> None:
+    """把贝果可能按下的键全部松开（W/A/S/D/F）。
+
+    任何停止路径都该调这个：正常收尾、异常中断、用户点停止。按键是注入到系统
+    全局的，进程退出不会自动松，残留的 W/A/S/D 会让下一局开局就跑偏。
+    """
+    for release in (
+        controller.move_w, controller.move_s, controller.move_a, controller.move_d,
+        controller.interact,
+    ):
+        try:
+            release(release=True)
+        except Exception:
+            log.error('贝果松开按键失败', exc_info=True)
+
+
+def register_release_at_exit(controller) -> None:
+    """注册进程退出兜底：异常退出（没走到收尾钩子）时也把键松开。"""
+    global _EXIT_HOOK_REGISTERED
+    if _EXIT_HOOK_REGISTERED:
+        return
+    _EXIT_HOOK_REGISTERED = True
+    atexit.register(lambda: release_all_keys(controller))
 
 SIDE_STEP: str = 'side_step'
 """点一下侧移（A 或 D）；方向记在 angle 上，-1 向左、1 向右。"""
@@ -542,6 +572,8 @@ class BagelInputWorker:
             seed_ratio: 上一局收敛的转向补偿比例，作为本局初值。
         """
         self.ctx: ZContext = ctx
+        register_release_at_exit(ctx.controller)
+        self._release_all_keys()
         self._forward_want: bool = False
         """主线意图：是否该一直按住前进。"""
         self._forward_down: bool = False
@@ -722,21 +754,31 @@ class BagelInputWorker:
         )
 
     def shutdown(self) -> None:
-        """停止全部通道并松开前进；退出路径必须调用。"""
+        """停止全部通道并松开全部按键；退出路径必须调用。"""
         self._stopping = True
         self.stop_forward()
         self._forward_thread.join(timeout=1.0)
         self._backward_thread.join(timeout=1.0)
+        self._strafe_thread.join(timeout=1.0)
         self._turn_worker.stop()
         self._instant_channel.stop()
-        try:
-            self.ctx.controller.move_w(release=True)
-            self.ctx.controller.move_s(release=True)
-            self.ctx.controller.interact(release=True)
-        except Exception:
-            log.error('贝果输入线程退出时松开按键失败', exc_info=True)
+        self._release_all_keys()
 
     # ---------- 前进通道 ----------
+
+    def _release_all_keys(self) -> None:
+        """把本模块可能按下的键全部松开（开局与退出各调一次）。"""
+        release_all_keys(self.ctx.controller)
+
+    def release_all(self) -> None:
+        """立刻松掉所有键；停止、暂停等收尾路径都该调它。"""
+        with self._forward_lock:
+            self._forward_want = False
+        with self._backward_lock:
+            self._backward_want = False
+        with self._strafe_lock:
+            self._strafe_want = 0
+        release_all_keys(self.ctx.controller)
 
     def _forward_loop(self) -> None:
         """对齐前进键，并在实际按下后计时完成短按。
