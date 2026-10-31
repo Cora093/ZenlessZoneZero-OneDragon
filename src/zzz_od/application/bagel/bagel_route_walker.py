@@ -19,8 +19,11 @@
 
 from __future__ import annotations
 
+import os
 import time
+from collections import deque
 from math import atan2, cos, degrees, hypot, radians, sin, sqrt
+from pathlib import Path
 from statistics import median
 from typing import TYPE_CHECKING
 
@@ -104,6 +107,13 @@ SPAWN_CONFIRM_FRAMES: int = 2
 SPAWN_OBSERVE_SECONDS: float = 10.0
 """出生点识别的最长观察时间（秒）；期间不移动角色。"""
 
+BEACON_ARRIVE_RADIUS: float = 3.0
+"""途径点（纯路点）的到点半径；仍按 3px 精准收口。"""
+
+BEACON_CROSS_TOLERANCE: float = 1.0
+"""线段穿越判定的额外容差（px）：定位是 1px 量化，留一个像素余量。"""
+
+
 ARRIVE_RADIUS: float = 3.0
 """到达半径：3px 内算到点（用户给定）。"""
 
@@ -115,9 +125,6 @@ SPRINT_DISTANCE: float = 30.0
 
 30px 外就冲刺，边跑边点闪避；30px 内不冲刺，松键改用走路逼近。
 """
-
-BEACON_SLOW_RADIUS: float = 10.0
-"""途径点慢步半径：进入它改用慢步走走停停，不再一路按住前进（用户给定）。"""
 
 NEAR_STEP_TURN_RADIUS: float = 8.0
 """距离目标点小于它就不再按角度停车转。
@@ -186,6 +193,15 @@ TURN_SCALE_SEED_SAMPLES: int = 8
 TURN_SCALE_SEED_SPREAD: float = 0.15
 """累积池离散度上限：超过它说明混进了被打断的脏样本，退回上一局的比例。"""
 
+MAX_POSITION_JUMP: float = 60.0
+"""单帧定位跳变上限（px）：实测正常帧位移 5~7px，几百像素的跳变只能是定位串层。"""
+
+POSITION_JUMP_CONFIRM_FRAMES: int = 2
+"""同一处新位置连续这么多帧才认可跳变（开门、电梯换区域确实会跳一次）。"""
+
+POSITION_JUMP_HOLD_SECONDS: float = 1.5
+"""跳变一直对不上时，最多沿用旧位置这么久，之后接受新位置，避免卡死。"""
+
 ANGLE_FAIL_SECONDS: float = 10.0
 """连续读不到镜头朝向超过这个时长才判失败（用户给定 10 秒）。
 
@@ -207,6 +223,74 @@ SPRINT_ALIGN_LIMIT: float = 15.0
 """冲刺闸门：偏差在它以内才冲刺，闸门外走普通速度。
 
 冲刺会把边走边转的横向漂移成倍放大。"""
+
+BEHIND_BAND: float = 112.5
+"""目标转到身后（超过它）就停止前进；只有刚走过头时才用后退纠偏。"""
+
+OVERSHOOT_RADIUS: float = 12.0
+"""目标在身后、距离又在这以内，视为刚走过头：短促后退一步。
+
+只在八向走位已经关掉的贴身区生效（更远处由八向的后退档处理），
+避免两种后退机制在点附近互相打断、造成可见的顿挫。"""
+
+OVERSHOOT_BACK_STEP: float = 0.18
+"""走过头后退一步的按压时长（秒）：给短一点，退多了会退到墙里。"""
+
+OVERSHOOT_STEP_LIMIT: int = 4
+"""单点最多后退几步；退不动说明后面是墙，交回停车转。"""
+
+MOVE_FORWARD_BAND: float = 22.5
+"""斜走兜底：偏差在这以内只按前进，超过它才考虑用侧移吃掉一部分。"""
+
+TURN_MIX_MID: float = 45.0
+"""八向混合的中间档（度）：0/45/90 三档之间的分界。"""
+
+MIX_CYCLE_SECONDS: float = 0.4
+"""八向混合一个循环的时长（秒）：档位按比例交替，一个循环内覆盖两档方向。
+
+取 0.4 是因为主循环一轮约 0.12 秒：循环太短会让按键每轮都翻，游戏里看着毛糙。"""
+
+VECTOR_STALL_SECONDS: float = 0.6
+"""八向走位时距离这么久没缩小，认为被挡住，改成停车转镜头。"""
+
+VECTOR_STALL_DISTANCE: float = 2.0
+"""距离缩小不到这么多像素算没进展。"""
+
+VECTOR_FALLBACK_LIMIT: int = 6
+"""单点最多因受阻回退几次；再挡就彻底停车转。"""
+
+DIAGONAL_TIME_LIMIT: float = 6.0
+"""单点最多八向走位这么多秒；之后交回「前进＋转镜头」，免得一直横着走。"""
+
+DIAGONAL_ROUND_SECONDS: float = 0.2
+"""主循环一轮的估计耗时，用来给斜走时间预算记账。"""
+
+DIAGONAL_MIN_DISTANCE: float = 12.0
+"""八向走位一直用到离点这么近为止：途径点附近也不停下来转镜头。
+
+实测 60px 就开始停着对准，角色在点附近会顿一下；缩到 12px（碎步半径上方）
+让八向一直走到贴身，视觉上不停顿。"""
+
+BLIND_WALK_SECONDS: float = 0.8
+"""定位刚丢时先按原方向盲走这么久再停：高危图里站着 2 秒就被打死。"""
+
+STRAFE_MIN_SEGMENT: float = 8.0
+"""路径线短于它就不拿它当基准（px）：两点几乎重合时方向会被量化放大。"""
+
+LOOKAHEAD_DISTANCE: float = 22.0
+"""前视距离（px）：沿「上一个点→当前目标点」往前取瞄准点，不直接瞄点位。
+
+人偏离路线时，瞄点位会让视线又被拉向点位（近点方位抖动大）；瞄线上前方
+一个点，行进方向贴着路线，横向偏差收敛更早。剩的距离不足它就退回瞄点位。"""
+
+
+
+
+ARROW_MIN_DISPLACEMENT: float = 5.0
+"""位移至少这么多像素才认为行进方向可信（px）。"""
+
+ARROW_MAX_AGE: float = 0.6
+"""只拿这么久以内的定位估行进方向（秒）。"""
 
 SMALL_STEP_PRESS: float = 0.08
 """碎步单次按压时长（秒）。"""
@@ -375,16 +459,43 @@ class BagelRouteWalker(BagelOperation):
         self.mechanical_retried: bool = False
         self.position: tuple[float, float] | None = None
         self.last_map_id: str | None = None
+        self.last_good_position: tuple[float, float] | None = None
+        """上一个可信定位，用于判单帧跳变。"""
+        self._jump_candidate: tuple[float, float] | None = None
+        """当前怀疑是跳变的新位置。"""
+        self._jump_candidate_frames: int = 0
+        """该新位置连续出现了几帧。"""
+        self._jump_reject_since: float | None = None
+        """开始拒绝跳变的时刻，用来兜底放行。"""
         self.locate_misses: int = 0
         self.locate_miss_since: float | None = None
         """连续定位失败的起始时刻，恢复定位后清空。"""
         self.angle_miss_since: float | None = None
         """连续读不到镜头朝向的起始时刻，读到朝向后清空。"""
         self.last_position: tuple[float, float] | None = None
+        self.prev_position: tuple[float, float] | None = None
+        """再上一帧定位，用于「线段是否穿过点位」的到达判定。"""
         self.steps: int = 0
         self.stuck_since: tuple[tuple[float, float], float] | None = None
         self.stuck_steps: int = 0
         """当前点已经侧移了几次，进入新点时清零。"""
+        self.overshoot_steps: int = 0
+        """当前点已经后退纠偏几次，进入新点时清零；防止对着墙一直后退。"""
+        self.diagonal_seconds: float = 0.0
+        """当前点已用掉的八向走位时间预算，进入新点时清零。"""
+        self.mix_phase: float = 0.0
+        """八向混合的相位（0~1）：小于占空比时用深一档方向。"""
+        self.mix_last_at: float = 0.0
+        """上一轮推进混合相位的时刻；0 表示还没开始。"""
+        self.vector_last_distance: float | None = None
+        """八向走位上一轮的距离，用来判有没有进展。"""
+        self.vector_stall_since: float | None = None
+        """八向走位开始走不动的时刻。"""
+        self.vector_fallbacks: int = 0
+        """当前点因受阻回退转镜头的次数，进入新点时清零。"""
+        self.pos_history: deque[tuple[float, float, float]] = deque(maxlen=12)
+        """最近几帧定位 (时刻, x, y)，用位移反推实际行进方向。"""
+        """因为行进方向还没跟上镜头而停下的连续轮数，用来兜底防止卡住。"""
         self.target_wait_since: float | None = None
         self.electronic_small_steps: bool = False
         """当前电子保险箱已进入短步阶段，定位回到半径外时也不恢复长步。"""
@@ -523,14 +634,72 @@ class BagelRouteWalker(BagelOperation):
         return crop
 
     def locate(self) -> tuple[float, float] | None:
-        """定位一次并更新所在地图。"""
+        """定位一次并更新所在地图。
+
+        单帧跳变超过 MAX_POSITION_JUMP 时先当作不可信、沿用上一个可信位置：
+        开门/电梯换区域时定位会串层，实测跳过 800 像素，照它算距离就会朝一个
+        不存在的点走。同一处新位置连续出现够多帧、或已经僵持够久，才认可换区域。
+        """
         result = self.locator.locate(self.minimap())
         if result is None:
             return None
-        locator, _score, center = result
+        locator, score, center = result
+        new_position = (float(center[0]), float(center[1]))
+        last = self.last_good_position
+        if last is not None:
+            jump = hypot(new_position[0] - last[0], new_position[1] - last[1])
+            if jump > MAX_POSITION_JUMP:
+                if (
+                    self._jump_candidate is not None
+                    and hypot(new_position[0] - self._jump_candidate[0],
+                              new_position[1] - self._jump_candidate[1]) <= 12.0
+                ):
+                    self._jump_candidate_frames += 1
+                else:
+                    self._jump_candidate = new_position
+                    self._jump_candidate_frames = 1
+                now = time.monotonic()
+                if self._jump_reject_since is None:
+                    self._jump_reject_since = now
+                confirmed = self._jump_candidate_frames >= POSITION_JUMP_CONFIRM_FRAMES
+                expired = now - self._jump_reject_since >= POSITION_JUMP_HOLD_SECONDS
+                if not confirmed and not expired:
+                    log.warning(
+                        '贝果定位单帧跳变 %.0fpx（层 %s 得分 %.2f），先沿用上一处位置 %s',
+                        jump, locator.map_id, score, last,
+                    )
+                    self._save_locator_jump(new_position, jump)
+                    return last
+                log.info(
+                    '贝果定位跳变 %.0fpx 已确认（连续 %s 帧，层 %s），按换区域接受',
+                    jump, self._jump_candidate_frames, locator.map_id,
+                )
+        self._jump_candidate = None
+        self._jump_candidate_frames = 0
+        self._jump_reject_since = None
         self.last_map_id = locator.map_id
-        self.position = (float(center[0]), float(center[1]))
+        self.last_good_position = new_position
+        self.position = new_position
         return self.position
+
+    def _save_locator_jump(self, position: tuple[float, float], jump: float) -> None:
+        """把跳变现场的小地图裁剪存下来，供离线查是哪一层匹配错了。"""
+        dump_dir = os.environ.get('BAGEL_LOCATOR_DUMP')
+        if not dump_dir:
+            return
+        try:
+            import cv2
+            directory = Path(dump_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime('%H%M%S')
+            name = f'{stamp}_{jump:.0f}px_{position[0]:.0f}_{position[1]:.0f}'
+            cv2.imwrite(
+                str(directory / f'{name}.png'),
+                cv2.cvtColor(self.minimap(), cv2.COLOR_RGB2BGR),
+            )
+            log.info('贝果定位跳变现场已存：%s', directory / f'{name}.png')
+        except Exception:
+            log.warning('存定位跳变现场失败', exc_info=True)
 
     def player_angle(self) -> float | None:
         """识别镜头朝向角，正右为 0、逆时针增加。
@@ -1103,7 +1272,14 @@ class BagelRouteWalker(BagelOperation):
                 return self.round_retry('起步定位失败，重试', wait=0.3)
             if self.locate_miss_since is None:
                 self.locate_miss_since = time.monotonic()
-            if time.monotonic() - self.locate_miss_since < LOCATE_FAIL_SECONDS:
+                # 记录丢掉定位前是不是在走：在走就盲走一小段，站着更容易被打死。
+                self.blind_walk_ok = self.sprinting or self.input_worker.forward_active
+            missing = time.monotonic() - self.locate_miss_since
+            if missing < BLIND_WALK_SECONDS and self.blind_walk_ok:
+                self.input_worker.hold_forward()
+                self._record_input()
+                return self.round_wait(f'定位丢失，盲走 {missing:.1f}s', wait=0.05)
+            if missing < LOCATE_FAIL_SECONDS:
                 self.locate_misses += 1
                 return self.round_wait('定位丢失，停下等待', wait=0.1)
             return self.round_recoverable_fail(
@@ -1111,7 +1287,9 @@ class BagelRouteWalker(BagelOperation):
             )
         self.locate_misses = 0
         self.locate_miss_since = None
+        self.prev_position = self.last_position
         self.last_position = position
+        self.pos_history.append((time.monotonic(), position[0], position[1]))
         distance = hypot(point.x - position[0], point.y - position[1])
         if (
             point.kind == 'electronic_safe'
@@ -1129,22 +1307,26 @@ class BagelRouteWalker(BagelOperation):
         if distance <= SPRINT_DISTANCE and self.sprinting:
             self._exit_sprint()
         if point.kind == BEACON:
-            # 途径点是纯路点：3px 内算到点，10px 内慢步逼近。
-            if distance <= ARRIVE_RADIUS:
+            # 途径点是纯路点：3px 内算到点，全程用八向巡航走过去（不切慢步）。
+            # 每轮位移 4~7px 比 3px 判据还大，所以再加一条「线段穿过」判定：
+            # 只要这一帧的位移线段从点位旁边经过就算到，不必真的落进圈里。
+            crossed = self._path_crosses_point(self.prev_position, position, point)
+            if distance <= BEACON_ARRIVE_RADIUS or crossed:
                 self._release_forward()
                 log.info(
-                    '贝果到点：第 %s 点判定距离 %.2fpx（判据 %.0fpx，位置 %s）',
-                    self.cursor + 1, distance, ARRIVE_RADIUS, position,
+                    '贝果到点：第 %s 点判定距离 %.2fpx（判据 %.0fpx%s，位置 %s）',
+                    self.cursor + 1, distance, BEACON_ARRIVE_RADIUS,
+                    '，线段穿过' if crossed else '', position,
                 )
                 self._enter_point(self.route_index, self.cursor + 1)
                 # 状态文字必须正好是「已到点」：节点边按状态精确匹配，
-                # 掺了距离就匹配不上，导航链会在这里断掉、整条路线直接判走完。
+                # 掺了距离就匹配不上，导航链在这里断掉、整条路线直接判走完。
                 return self.round_success('已到点')
-            if distance <= BEACON_SLOW_RADIUS:
-                return self._slow_step(point, position)
             return self._cruise(point, position)
         # 电子保险箱进入 15px 后保持短步；其他箱类仍在 3px 内使用碎步。
         # 可信提示出现就转入交互，不要求先走到原地等待半径。
+        # 箱类分支不用侧移：八向走位残留的 A/D 会让慢步逼近时一直横滑。
+        self.input_worker.stop_strafe()
         prompt = self._prompt_stop(distance)
         if prompt is not None:
             return prompt
@@ -1217,6 +1399,9 @@ class BagelRouteWalker(BagelOperation):
             self.angle_miss_since = None
             return None
         self._release_forward()
+        # 读不到朝向时不知道偏哪里，侧移/后退也要一起松，否则会一直朝一个方向横移。
+        self.input_worker.stop_strafe()
+        self.input_worker.stop_backward()
         if self.angle_miss_since is None:
             self.angle_miss_since = time.monotonic()
         missed = time.monotonic() - self.angle_miss_since
@@ -1242,11 +1427,38 @@ class BagelRouteWalker(BagelOperation):
         miss = self._angle_miss_result(angle)
         if miss is not None:
             return miss
-        target_angle = self._target_angle(position, point)
+        aim_x, aim_y = self._aim_point(position, point)
+        target_angle = self._angle_to(position, aim_x, aim_y)
         controller_angle = angle % 360
         angle_diff = cal_utils.angle_delta(controller_angle, target_angle)
         distance = hypot(point.x - position[0], point.y - position[1])
         near = distance <= NEAR_STEP_TURN_RADIUS
+        if (
+            abs(angle_diff) > BEHIND_BAND and distance <= OVERSHOOT_RADIUS
+            and self.overshoot_steps < OVERSHOOT_STEP_LIMIT
+        ):
+            # 刚走过头：短促后退一步步退回路径上，比转 180 度再走一遍省事。
+            # 只后退、不侧移不斜走：侧移在走廊里只会顶墙（实测侧移纠偏会把卡死率拉高）。
+            self.overshoot_steps += 1
+            self._release_forward()
+            self.input_worker.stop_strafe()
+            self._stop_sprint()
+            self.input_worker.back_step(OVERSHOOT_BACK_STEP)
+            self._record_input()
+            return self.round_wait(f'走过头，后退纠偏 {angle_diff:.0f}度', wait=OVERSHOOT_BACK_STEP + 0.1)
+        if (
+            abs(angle_diff) > MOVE_FORWARD_BAND
+            and distance > DIAGONAL_MIN_DISTANCE
+            and self.diagonal_seconds < DIAGONAL_TIME_LIMIT
+            and self.vector_fallbacks < VECTOR_FALLBACK_LIMIT
+        ):
+            return self._vector_move(
+                point, position, controller_angle, angle_diff, target_angle, distance,
+            )
+        self.input_worker.stop_strafe()
+        self.input_worker.stop_backward()
+        self.vector_last_distance = None
+        self.vector_stall_since = None
         stopping = abs(angle_diff) > WALK_TURN_ANGLE and not near
         aligning = abs(angle_diff) > CRUISE_ALIGN_LIMIT and not near
         # 停车转要对准到 2 度；边走边修不追 2 度——移动中下发实测散布 5.6%（静止 1.1%），
@@ -1265,10 +1477,141 @@ class BagelRouteWalker(BagelOperation):
         stuck = self._check_stuck(position, point, controller_angle)
         if stuck is not None:
             return stuck
+        # 这里原本有一道「等行进方向跟上」的闸门：镜头对准、人还在旧方向时停一轮。
+        # 八向混合上线后方向由按键混合直接保证，闸门在每次转弯都误判并停一轮
+        # （实测 3 局停了 55 次，每局白站 3~5 秒），已删除。
         if self.input_worker.hold_forward():
             self._record_input()
         self._set_sprint(distance, aligned=abs(angle_diff) <= SPRINT_ALIGN_LIMIT)
         return self.round_wait('冲刺前进' if self.sprinting else '按住前进')
+
+    @staticmethod
+    def _path_crosses_point(
+        start: tuple[float, float] | None, end: tuple[float, float], point: BagelRoutePoint,
+    ) -> bool:
+        """这一帧的位移线段是否从目标点旁边穿过。
+
+        Args:
+            start: 上一帧定位；没有就判不穿过。
+            end: 当前定位。
+            point: 当前目标点。
+
+        Returns:
+            线段到目标点的垂距在「到点半径 + 容差」以内、且垂足落在两帧之间时返回 True。
+        """
+        if start is None:
+            return False
+        ax, ay = start
+        bx, by = end
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        if length2 <= 0:
+            return False
+        t = ((point.x - ax) * dx + (point.y - ay) * dy) / length2
+        if not 0.0 <= t <= 1.0:
+            return False
+        closest_x = ax + t * dx
+        closest_y = ay + t * dy
+        return hypot(point.x - closest_x, point.y - closest_y) <= (
+            BEACON_ARRIVE_RADIUS + BEACON_CROSS_TOLERANCE
+        )
+
+    def _vector_move(
+        self, point: BagelRoutePoint, position: tuple[float, float], controller_angle: float,
+        angle_diff: float, target_angle: float, distance: float,
+    ) -> OperationRoundResult:
+        """八向走位：按偏差选 W/A/S/D 组合走过去，同时让镜头继续转。
+
+        分档（偏差绝对值）：22.5 度内只前进（由 _cruise 处理）、到 67.5 度前进＋侧移、
+        到 112.5 度只侧移、再往后按后退——路线折返时就是倒着走到下一个点，不用停下来
+        转镜头。**镜头不停**：继续提交目标角，位移方向跟着镜头一起收敛，避免长时间
+        背身横移那种「眩晕」，也不站在转角挨打。
+
+        只有距离一直不缩小（被墙或箱子挡住）才回退成停车转镜头，单点有次数上限。
+
+        Args:
+            point: 当前目标点。
+            position: 当前可靠定位。
+            controller_angle: 当前镜头朝向（度）。
+            angle_diff: 目标方位与镜头朝向的有符号差，正数表示目标在左侧。
+            target_angle: 目标方位（度）。
+            distance: 到目标点的距离（px）。
+
+        Returns:
+            本轮结果。
+        """
+        magnitude = abs(angle_diff)
+        side = -1 if angle_diff > 0 else 1
+        """侧移方向：角度为正表示目标在镜头左侧，按 A。"""
+        if self.vector_last_distance is None or distance < self.vector_last_distance - VECTOR_STALL_DISTANCE:
+            self.vector_last_distance = distance
+            self.vector_stall_since = None
+        else:
+            now = time.monotonic()
+            if self.vector_stall_since is None:
+                self.vector_stall_since = now
+            elif now - self.vector_stall_since >= VECTOR_STALL_SECONDS:
+                self.vector_fallbacks += 1
+                self.vector_last_distance = None
+                self.vector_stall_since = None
+                self.input_worker.stop_strafe()
+                self.input_worker.stop_backward()
+                self._release_forward()
+                self._stop_sprint()
+                self._submit_turn(target_angle, deadband=TURN_DEADBAND_FAST)
+                return self.round_wait(f'八向受阻，改转镜头 {angle_diff:.0f}度')
+        self.diagonal_seconds += DIAGONAL_ROUND_SECONDS
+        # 镜头继续转：位移方向随镜头一起收敛，偏差比背身横移时小得多。
+        self._submit_turn(target_angle, deadband=TURN_DEADBAND)
+        if magnitude > BEHIND_BAND:
+            # 目标在身后：不按后退（实测倒着走进死角会顶墙、卡住），
+            # 停车把镜头转过来再走——这段是急弯/折返，停一下换方向比倒着蹭安全。
+            self.input_worker.stop_strafe()
+            self.input_worker.stop_backward()
+            self._release_forward()
+            self._stop_sprint()
+            self._submit_turn(target_angle, deadband=TURN_DEADBAND_FAST)
+            return self.round_wait(f'身后目标，停车转 {angle_diff:.0f}度')
+        self.input_worker.stop_backward()
+        # 八向混合：镜头偏 Δ 时按比例交替 0/45/90 度三档按键，把实际行进方向压在
+        # 目标方位上。镜头的转动只管最终对齐，跑位不再等它——弧和事后横滑都不用发生。
+        use_forward, use_strafe = self._eight_way_step(magnitude)
+        if use_forward:
+            self.input_worker.hold_forward()
+        else:
+            self.input_worker.stop_forward()
+        if use_strafe:
+            self.input_worker.hold_strafe(side)
+        else:
+            self.input_worker.stop_strafe()
+        self._stop_sprint()
+        self._record_input()
+        suffix = '·侧移' if use_strafe else ''
+        lag = self._arrow_lag(point)
+        if lag is not None:
+            # 行进偏：实际行进方向与路线段的夹角，混合有没有把方向掰过去就看这个。
+            suffix += f'·行进偏{lag:.0f}度'
+        return self.round_wait(f'八向混合 {angle_diff:.0f}度{suffix}')
+
+    def _eight_way_step(self, magnitude: float) -> tuple[bool, bool]:
+        """按镜头偏差做八向混合，返回本轮 (是否按前进, 是否按侧移)。
+
+        镜头偏差 Δ 要走的实际方向就在镜头和侧移之间：Δ≤45 度时在「前进」与
+        「前进+侧移」之间按 Δ/45 交替，45~112.5 度时在「前进+侧移」与「只侧移」
+        之间按 (Δ-45)/45 交替。按比例交替出来的平均方向就是 Δ，所以不用等镜头转完。
+        """
+        now = time.monotonic()
+        delta = now - self.mix_last_at if self.mix_last_at > 0 else DIAGONAL_ROUND_SECONDS
+        self.mix_last_at = now
+        self.mix_phase = (self.mix_phase + delta / MIX_CYCLE_SECONDS) % 1.0
+        if magnitude <= TURN_MIX_MID:
+            depth = magnitude / TURN_MIX_MID
+            shallow, deep = (True, False), (True, True)
+        else:
+            depth = (magnitude - TURN_MIX_MID) / TURN_MIX_MID
+            shallow, deep = (True, True), (False, True)
+        depth = max(0.0, min(depth, 1.0))
+        return deep if self.mix_phase < depth else shallow
 
     def _submit_turn(self, target: float, cruise_only: bool = False, deadband: float = TURN_DEADBAND) -> None:
         """提交目标方向给转向线程；只存不定夺，不记输入。
@@ -1534,7 +1877,67 @@ class BagelRouteWalker(BagelOperation):
         与朝向识别（analyze）同一套坐标系：屏幕上方为正、逆时针增加，
         所以纵向取负号；符号写反会让角色一直原地打转。
         """
-        return degrees(atan2(-(point.y - position[1]), point.x - position[0])) % 360
+        return BagelRouteWalker._angle_to(position, point.x, point.y)
+
+    @staticmethod
+    def _angle_to(position: tuple[float, float], x: float, y: float) -> float:
+        """当前位置指向坐标 (x, y) 的角度，与 _target_angle 同一套坐标系。"""
+        return degrees(atan2(-(y - position[1]), x - position[0])) % 360
+
+    def _movement_heading(self) -> float | None:
+        """用最近位移反推实际行进方向（度，与 _target_angle 同一坐标系）。
+
+        镜头对准不等于人在朝那个方向走：角色箭头比镜头滞后约 0.35 秒。
+        位移不足 ARROW_MIN_DISPLACEMENT 或定位太旧时返回 None。
+        """
+        if len(self.pos_history) < 2:
+            return None
+        now = time.monotonic()
+        x1, y1 = self.pos_history[-1][1], self.pos_history[-1][2]
+        for t0, x0, y0 in reversed(self.pos_history):
+            if now - t0 > ARROW_MAX_AGE:
+                break
+            if hypot(x1 - x0, y1 - y0) >= ARROW_MIN_DISPLACEMENT:
+                return self._angle_to((x0, y0), x1, y1)
+        return None
+
+    def _arrow_lag(self, point: BagelRoutePoint) -> float | None:
+        """实际行进方向与路线段方向的夹角（度，取绝对值）；量不到返回 None。
+
+        比对的是「上一个点→当前目标点」这条段的方向，不是瞬时瞄点方位：
+        离点 5px 内瞄点方位自身就会摆 60~80 度，拿它当基准全是假滞后。
+        """
+        origin = self._previous_point()
+        if origin is None:
+            return None
+        if hypot(point.x - origin.x, point.y - origin.y) < STRAFE_MIN_SEGMENT:
+            return None
+        heading = self._movement_heading()
+        if heading is None:
+            return None
+        path_heading = self._angle_to((origin.x, origin.y), point.x, point.y)
+        return abs(cal_utils.angle_delta(heading, path_heading))
+
+    def _aim_point(
+        self, position: tuple[float, float], point: BagelRoutePoint,
+    ) -> tuple[float, float]:
+        """巡航瞄准点：路径线上前方 LOOKAHEAD_DISTANCE 处的点。
+
+        没有上一个点、路径线太短、或剩余距离不足前视距离时，直接返回目标点本身。
+        """
+        origin = self._previous_point()
+        if origin is None:
+            return (point.x, point.y)
+        length = hypot(point.x - origin.x, point.y - origin.y)
+        if length < STRAFE_MIN_SEGMENT:
+            return (point.x, point.y)
+        foot_x, foot_y = _closest_on_segment(origin, point, position)
+        remain = hypot(point.x - foot_x, point.y - foot_y)
+        if remain <= LOOKAHEAD_DISTANCE:
+            return (point.x, point.y)
+        ux = (point.x - origin.x) / length
+        uy = (point.y - origin.y) / length
+        return (foot_x + ux * LOOKAHEAD_DISTANCE, foot_y + uy * LOOKAHEAD_DISTANCE)
 
     def _check_stuck(
         self, position: tuple[float, float], point: BagelRoutePoint, angle: float,
@@ -1668,6 +2071,15 @@ class BagelRouteWalker(BagelOperation):
         self.steps = 0
         self.stuck_since = None
         self.stuck_steps = 0
+        self.overshoot_steps = 0
+        self.diagonal_seconds = 0.0
+        self.mix_phase = 0.0
+        self.mix_last_at = 0.0
+        self.blind_walk_ok = False
+        self.vector_last_distance = None
+        self.vector_stall_since = None
+        self.vector_fallbacks = 0
+        self.pos_history.clear()
         self.elevator_phase = None
         self.elevator_since = None
 
@@ -1732,12 +2144,13 @@ class BagelRouteWalker(BagelOperation):
             self.last_screenshot_time = op.last_screenshot_time
 
     def handle_pause(self) -> None:
-        """暂停时松键，并让转向线程立刻停手。
+        """暂停时把所有键松开，并让转向线程立刻停手。
 
-        暂停期间主线不再提交，靠提交新鲜度线程 1 秒后也会自己停；
-        这里主动清一次，不等那 1 秒，避免暂停瞬间按旧目标转镜头。
+        暂停期间主线不再提交，靠提交新鲜度线程 1 秒后也会自己停；这里主动清一次，
+        避免暂停瞬间按旧目标转镜头。按键是注入到系统全局的，暂停（尤其是人工暂停）
+        后可能长时间不恢复，残留的 W/A/S/D 会被一直按住，所以一律全松。
         """
-        self._release_forward()
+        self.input_worker.release_all()
         self.input_worker.submit_turn(None)
         super().handle_pause()
 

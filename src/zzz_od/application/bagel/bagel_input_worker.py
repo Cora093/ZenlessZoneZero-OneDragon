@@ -49,7 +49,6 @@ RELEASE_INTERACT: str = 'release_interact'
 DODGE: str = 'dodge'
 """点一下闪避，用于维持冲刺。"""
 
-
 _EXIT_HOOK_REGISTERED: bool = False
 """进程退出兜底是否已注册；只注册一次。"""
 
@@ -78,8 +77,12 @@ def register_release_at_exit(controller) -> None:
     _EXIT_HOOK_REGISTERED = True
     atexit.register(lambda: release_all_keys(controller))
 
+
 SIDE_STEP: str = 'side_step'
 """点一下侧移（A 或 D）；方向记在 angle 上，-1 向左、1 向右。"""
+
+BACK_STEP: str = 'back_step'
+"""点一下后退（S），用于走过头时退回路径上，免得转 180 度重走。"""
 
 SLEEP_SLICE: float = 0.01
 """等待轮询的切片时长（秒）。"""
@@ -116,19 +119,15 @@ TURN_RATIO_MAX: float = 20.0
 STOP_TURN_CAP: float = 180.0
 """停车转的单次上限（度）：偏差多大就一把转到位，最大 180 度（掉头）。"""
 
-STOP_TURN_CAP_WARMUP: float = 45.0
-"""比例还没攒够样本时用的保守上限（度）：一次别甩太大。"""
 
-TURN_CAP_TRUST_SAMPLES: int = 3
-"""攒够这么多个样本才放宽到 STOP_TURN_CAP。"""
 
-CRUISE_TURN_CAP: float = 30.0
-"""边走边转的单笔上限（度）。仓内既有口径：world_patrol 45 度、bagel_navigate 30 度。"""
+CRUISE_TURN_CAP: float = 20.0
+"""边走边转的单笔上限（度）：角色箭头比镜头滞后约 0.34x步长、要 0.35 秒才跟上，
+步长压到 20 度以内滞后才 ≤7 度；大步只在停车转时用（见 STOP_TURN_CAP）。"""
 
 TURN_CRUISE_LIMIT: float = 45.0
 """偏差在它以内一律边走边转，超过它才停车转。仓内既有口径：world_patrol 与
-bagel_navigate 都是「只有超过 90 度才停」，这里取 45 度更保守，配合 30 度单笔上限，
-转角处可以边走边掰过去，不用停下来等。"""
+bagel_navigate 都是「只有超过 90 度才停」，这里取 45 度更保守，转角处可以边走边掰过去。"""
 
 TURN_RATIO_PEAK_BIN_WIDTH: float = 0.05
 """实时校准分箱宽度：箱以 1.0 为中心（如 0.975~1.025），每样本只做一次槽计数加一与峰值比较。"""
@@ -142,9 +141,26 @@ TURN_SCALE_SAMPLE_MIN_COMMAND: float = 8.0
 TURN_SETTLE_GRACE: float = 0.4
 """下发转向后这么久内画面没变化不计数：实测转稳中位 0.24 秒、最大 0.31 秒。"""
 
-TURN_POST_TURN_QUIET: float = 0.3
-"""下发转向后这么久内不截图：宽限内的样本本来就直接丢掉，不采省截图开销。
-转稳最大 0.31 秒，0.3 停采后补 3 帧判稳，首个样本约 0.39 秒落地，不丢精度。"""
+TURN_POST_TURN_QUIET: float = 0.06
+"""下发后静默这么久不采样（秒）：等这次拖拽走完，别拿中途的画面算偏差。"""
+
+TURN_PROPORTIONAL_GAIN: float = 0.35
+"""比例转向增益：每笔只转剩余偏差的这个比例。
+
+不能取大：镜头要 0.1~0.2 秒才体现出这一笔，取 0.5 会按旧偏差继续发指令、
+甩过头再反着修，实测镜头换向从 0.8 次/分涨到 5.7 次/分、走成 S 形。"""
+
+TURN_PROPORTIONAL_INTERVAL: float = 0.10
+"""比例转向的最小下发间隔（秒）：一笔拖拽要按住-移动-松开，太密会互相打断。"""
+
+TURN_COARSE_LIMIT: float = 22.5
+"""""超过它就走前馈一笔到位，以内才用阻尼比例细调（度）。"""""
+
+TURN_MIN_STEP: float = 2.5
+"""小于这个角度不下发（度）：否则会围绕死区边界一直发 1~2 度的小拖拽，镜头一直在抖。"""
+
+TURN_OBSERVE_TIMEOUT: float = 0.5
+"""等上一笔效果的最长时间（秒）：超过就认为画面没体现，放行下一笔，别把转向饿死。"""
 
 TURN_STILL_TIMEOUT: float = 1.0
 """宽限过后，画面持续没变化超过这么久就放行下一笔，不重置校准。
@@ -301,8 +317,16 @@ class _TurnWorker:
         """上次真正下发的转角，等转稳后用来算校准样本。"""
         self._pending_at: float = 0.0
         """上次下发的时刻；宽限内画面没变化不计数。"""
+        self._pending_cruise: bool = False
+        """上次下发是不是边走边转；移动中的下发散布大，不进局末写回的样本。"""
         self._still_since: float | None = None
         """宽限过后首次看到画面没动的时刻；超时只放行下一笔，不碰校准。"""
+        self._last_issue_at: float = 0.0
+        """上次下发转角的时刻，用来限频（两次下发至少隔 TURN_PROPORTIONAL_INTERVAL）。"""
+        self._await_anchor: float = 0.0
+        """上一笔下发时的朝向；配 _await_change 判断这一笔有没有在画面上体现。"""
+        self._await_change: float = 0.0
+        """要等画面转过这么多度才允许发下一笔；0 表示不用等。"""
         self.turn_ratio: float = _clamp_ratio(seed_ratio)
         """转向校准值：名义转角乘它就是实际转角，1.0 表示还没校准过。
         每局新建线程时用上一局收敛值做初值（seed_ratio），省掉开局几次偏转。"""
@@ -373,19 +397,8 @@ class _TurnWorker:
         self._wake.set()
         self._thread.join(timeout=1.0)
 
-    @staticmethod
-    def _stable(history: list[float]) -> bool:
-        """连续几帧的朝向差是否都在防抖内；处理 0/360 跨界。"""
-        if len(history) < TURN_STABLE_FRAMES:
-            return False
-        recent = history[-TURN_STABLE_FRAMES:]
-        return all(
-            abs(cal_utils.angle_delta(a, b)) <= TURN_STABLE_JITTER
-            for a, b in zip(recent, recent[1:], strict=False)
-        )
-
     def _loop(self) -> None:
-        """按固定间隔自己采样：稳了、有偏差、上一笔已校准，才转。"""
+        """按固定间隔采样，按剩余偏差的比例连续跟：不等画面稳，也不一口气甩到位。"""
         while True:
             self._wake.wait(TURN_SAMPLE_INTERVAL)
             self._wake.clear()
@@ -397,13 +410,14 @@ class _TurnWorker:
                     and time.monotonic() - self._pending_at < TURN_POST_TURN_QUIET
                 )
             if in_quiet:
-                # 下发后静默期内不截图：这段的样本本来就丢掉，采了也是浪费。
+                # 下发后静默期内不截图：这一段的画面还在转，采了也不准。
                 continue
             try:
                 current = self._sampler()
             except Exception:
                 log.error('贝果转向采样朝向失败', exc_info=True)
                 current = None
+            now = time.monotonic()
             with self._lock:
                 if self._stopping:
                     return
@@ -414,62 +428,73 @@ class _TurnWorker:
                 else:
                     self._history.append(current % 360)
                 history = list(self._history)
-                pending = self._pending
-                anchor = self._anchor
-            if not history:
-                continue
-            # 目标过期先处理：即使上一笔卡住没学完，暂停/开箱后也不留旧目标。
-            # 否则学样本返回等待会跳过后边的过期分支，旧目标一直留着。
-            with self._lock:
                 if (
                     self._target is not None
-                    and time.monotonic() - self._target_at > TURN_TARGET_FRESH_SECONDS
+                    and now - self._target_at > TURN_TARGET_FRESH_SECONDS
                 ):
+                    # 主线超过 1 秒没提交（开箱、等提示、暂停）：目标过期，停手。
                     self._target = None
-            if not self._stable(history):
-                # 画面在动：不是静止，计时清掉重来。
-                with self._lock:
-                    self._still_since = None
+                    self._pending = None
+                    self._anchor = None
+                target = self._target
+                deadband = self._target_deadband
+                cruise_only = self._target_cruise_only
+                pending = self._pending
+                anchor = self._anchor
+                pending_at = self._pending_at
+                last_issue_at = self._last_issue_at
+                await_anchor = self._await_anchor
+                await_change = self._await_change
+            if target is None or not history:
                 continue
-            stable_angle = history[-1]
-            if pending is not None and anchor is not None:
-                # 上一笔转完又有 3 帧稳了，拿稳态差算样本，不拿转一半的中间帧。
-                if not self._learn(anchor, pending, stable_angle):
+            if (
+                pending is not None and anchor is not None
+                and now - max(pending_at, last_issue_at) >= TURN_SETTLE_GRACE
+                and len(history) >= 2
+                and abs(cal_utils.angle_delta(history[-1], history[-2])) <= TURN_STABLE_JITTER
+            ):
+                # 只有在「下发后静了满宽限期」才算单笔样本：连续比例转时两次采样之间
+                # 可能已经发了 2~3 笔拖拽，拿它反推比例会把校准值放大成 3 倍多。
+                self._learn(anchor, pending, history[-1])
+            deviation = cal_utils.angle_delta(history[-1], target)
+            if abs(deviation) <= deadband:
+                continue
+            if now - last_issue_at < TURN_PROPORTIONAL_INTERVAL:
+                continue
+            # 上一笔的效果要先在画面上看见再发下一笔，否则指令会堆叠、镜头甩过头再甩回来。
+            if (
+                await_change > 0.0
+                and now - last_issue_at < TURN_OBSERVE_TIMEOUT
+                and abs(cal_utils.angle_delta(await_anchor, history[-1])) < await_change
+            ):
+                continue
+            magnitude = abs(deviation)
+            in_motion = cruise_only or magnitude <= TURN_CRUISE_LIMIT
+            cap = CRUISE_TURN_CAP if in_motion else STOP_TURN_CAP
+            if magnitude > TURN_COARSE_LIMIT:
+                # 粗调：前馈一笔到位。实测一笔 180 度残差中位 6.5 度、稳到 ±2 度 0.3 秒；
+                # 拆成多笔残差反而 14.5 度（移动中测量散布 5.6%、静止 1.1%），还会画弧。
+                nominal = min(magnitude, cap)
+            else:
+                nominal = min(magnitude * TURN_PROPORTIONAL_GAIN, cap)
+                if nominal < TURN_MIN_STEP:
+                    # 剩这一点点就别再发了，否则围绕死区边界一直抖。
                     continue
+            signed = nominal if deviation > 0 else -nominal
+            ratio = self.turn_ratio
+            actual = signed / ratio if ratio else signed
+            # 上限按真正拖拽的角度算：比例小于 1 时下发角会被放大，只夹名义角等于没夹。
+            actual = max(-cap, min(actual, cap))
             with self._lock:
                 if self._stopping:
                     return
-                if self._pending is not None:
-                    continue
-                if self._target is None:
-                    continue
-                if time.monotonic() - self._target_at > TURN_TARGET_FRESH_SECONDS:
-                    # 主线超过 1 秒没提交（开箱、等提示、暂停），目标过期不清历史：
-                    # 画面朝向帧还接着用，恢复提交后不用重数 3 帧。
-                    self._target = None
-                    continue
-                deviation = cal_utils.angle_delta(stable_angle, self._target)
-                deadband = self._target_deadband
-                if abs(deviation) <= deadband:
-                    continue
-                cruise_only = self._target_cruise_only
-                magnitude = abs(deviation)
-                if cruise_only or magnitude <= TURN_CRUISE_LIMIT:
-                    cap = CRUISE_TURN_CAP
-                elif self.turn_samples >= TURN_CAP_TRUST_SAMPLES:
-                    cap = STOP_TURN_CAP
-                else:
-                    cap = STOP_TURN_CAP_WARMUP
-                nominal = float(max(int(min(magnitude, cap)), 1))
-                signed = nominal if deviation > 0 else -nominal
-                ratio = self.turn_ratio
-                actual = signed / ratio if ratio else signed
-                # 上限按真正拖拽的角度算：比例小于 1 时下发角会被放大，只夹名义角等于没夹。
-                actual = max(-cap, min(actual, cap))
                 self._pending = actual
-                self._pending_at = time.monotonic()
-                self._anchor = stable_angle
-                self._history.clear()
+                self._pending_cruise = in_motion
+                self._pending_at = now
+                self._anchor = history[-1]
+                self._await_anchor = history[-1]
+                self._await_change = max(TURN_MIN_STEP, nominal * 0.5)
+                self._last_issue_at = now
                 self._busy = True
             try:
                 self._handler(actual)
@@ -540,11 +565,16 @@ class _TurnWorker:
                 self._peak_count = slot_count
                 self.turn_ratio = 1.0 + key * TURN_RATIO_PEAK_BIN_WIDTH
             self.turn_samples += 1
-            self._scale_samples.append(abs(pending) / abs(delta) if delta else 1.0)
+            in_motion = self._pending_cruise
+            if not in_motion:
+                # 只有静止下发进局末写回：移动中下发实测散布 5.6 度、还系统性转不够，
+                # 混进去会把下一局的 turn_dx 带偏。
+                self._scale_samples.append(abs(pending) / abs(delta) if delta else 1.0)
             ratio, total = self.turn_ratio, self.turn_samples
         log.info(
-            '贝果转向校准 %.3f（样本 %.2f，峰值槽 %s 个，名义 %.1f 实际 %.1f，共 %s 次）',
+            '贝果转向校准 %.3f（样本 %.2f，峰值槽 %s 个，名义 %.1f 实际 %.1f，共 %s 次%s）',
             ratio, sample, self._peak_count, pending, delta, total,
+            '，边走边转不计入写回' if in_motion else '',
         )
         if TURN_RATIO_MIN * 1.2 <= ratio <= TURN_RATIO_MAX / 1.2:
             with self._lock:
@@ -572,8 +602,6 @@ class BagelInputWorker:
             seed_ratio: 上一局收敛的转向补偿比例，作为本局初值。
         """
         self.ctx: ZContext = ctx
-        register_release_at_exit(ctx.controller)
-        self._release_all_keys()
         self._forward_want: bool = False
         """主线意图：是否该一直按住前进。"""
         self._forward_down: bool = False
@@ -590,7 +618,14 @@ class BagelInputWorker:
         self._backward_down: bool = False
         """实际状态：S 键现在是否真的按着。"""
         self._backward_lock: threading.Lock = threading.Lock()
+        self._strafe_want: int = 0
+        """主线意图：侧移方向，1=右(D)，-1=左(A)，0=不按；用于斜向纠偏。"""
+        self._strafe_down: int = 0
+        """实际状态：当前按着哪个侧移键，0 表示都没按。"""
+        self._strafe_lock: threading.Lock = threading.Lock()
         self._stopping: bool = False
+        register_release_at_exit(ctx.controller)
+        self._release_all_keys()
 
         self._turn_worker: _TurnWorker = _TurnWorker(
             self._run_turn, self._sample_angle, seed_ratio=seed_ratio,
@@ -606,6 +641,10 @@ class BagelInputWorker:
             target=self._backward_loop, name='bagel-backward', daemon=True,
         )
         self._backward_thread.start()
+        self._strafe_thread: threading.Thread = threading.Thread(
+            target=self._strafe_loop, name='bagel-strafe', daemon=True,
+        )
+        self._strafe_thread.start()
 
     # ---------- 主线投递 ----------
 
@@ -655,6 +694,12 @@ class BagelInputWorker:
             return self._forward_step_duration is not None
 
     @property
+    def forward_active(self) -> bool:
+        """当前是否按着前进键（意图或真实按键任一是按下）。"""
+        with self._forward_lock:
+            return self._forward_want or self._forward_down
+
+    @property
     def forward_released_at(self) -> float | None:
         """前进已停止时返回最近松键时间；仍持键或有待执行请求时返回 None。"""
         with self._forward_lock:
@@ -671,6 +716,20 @@ class BagelInputWorker:
         """松开后退。"""
         with self._backward_lock:
             self._backward_want = False
+
+    def hold_strafe(self, direction: int) -> None:
+        """希望一直按着某个侧移键，用于斜向纠偏。
+
+        Args:
+            direction: 1 按 D（角色右手边），-1 按 A（左手边），0 松开。
+        """
+        with self._strafe_lock:
+            self._strafe_want = 1 if direction > 0 else (-1 if direction < 0 else 0)
+
+    def stop_strafe(self) -> None:
+        """松开两个侧移键。"""
+        with self._strafe_lock:
+            self._strafe_want = 0
 
     def submit_turn(self, target: float | None, cruise_only: bool = False, deadband: float = TURN_DEADBAND) -> None:
         """提交最新目标方向；只存不定夺，朝向由转向线程自己采样。
@@ -753,8 +812,16 @@ class BagelInputWorker:
             _Command(SIDE_STEP, duration=duration, angle=1.0 if direction > 0 else -1.0),
         )
 
+    def back_step(self, duration: float = 0.2) -> None:
+        """点一下后退，用于走过头时退回路径上。
+
+        Args:
+            duration: 按住时长（秒）；给短一点，退多了会退到墙里。
+        """
+        self._instant_channel.put(_Command(BACK_STEP, duration=duration))
+
     def shutdown(self) -> None:
-        """停止全部通道并松开全部按键；退出路径必须调用。"""
+        """停止全部通道并松开前进；退出路径必须调用。"""
         self._stopping = True
         self.stop_forward()
         self._forward_thread.join(timeout=1.0)
@@ -840,6 +907,29 @@ class BagelInputWorker:
                         self._backward_down = want
                     except Exception:
                         log.error('贝果输入线程切换后退键失败', exc_info=True)
+            time.sleep(SLEEP_SLICE)
+
+    def _strafe_loop(self) -> None:
+        """每周期把侧移键（A/D）对齐到意图状态。
+
+        侧移不改镜头朝向，斜向纠偏时用它把偏差吃掉一部分，少转一点镜头。
+        """
+        while not self._stopping:
+            with self._strafe_lock:
+                want = self._strafe_want
+                if want != self._strafe_down:
+                    try:
+                        if self._strafe_down > 0:
+                            self.ctx.controller.move_d(release=True)
+                        elif self._strafe_down < 0:
+                            self.ctx.controller.move_a(release=True)
+                        if want > 0:
+                            self.ctx.controller.move_d(press=True)
+                        elif want < 0:
+                            self.ctx.controller.move_a(press=True)
+                        self._strafe_down = want
+                    except Exception:
+                        log.error('贝果输入线程切换侧移键失败', exc_info=True)
             time.sleep(SLEEP_SLICE)
 
     # ---------- 转向通道 ----------
@@ -942,3 +1032,10 @@ class BagelInputWorker:
             key(press=True)
             time.sleep(command.duration or 0.0)
             key(release=True)
+            return
+        if command.kind == BACK_STEP:
+            # 只按一小段后退：走过头时用来退回路径上，走得越久越容易退到墙里，
+            # 所以时长由调用方给死，不在这里自适应。
+            controller.move_s(press=True)
+            time.sleep(command.duration or 0.0)
+            controller.move_s(release=True)
