@@ -16,6 +16,7 @@ from zzz_od.application.bagel import (
 )
 from zzz_od.application.bagel.bagel_deposit import BagelDeposit
 from zzz_od.application.bagel.bagel_enter import BagelEnter
+from zzz_od.application.bagel.bagel_input_worker import release_all_keys
 from zzz_od.application.bagel.bagel_exit import BagelExit
 from zzz_od.application.bagel.bagel_log import BagelRoundLog
 from zzz_od.application.bagel.bagel_operation import (
@@ -366,6 +367,12 @@ class BagelApp(ZApplication):
             self.failure_retries_used += 1
             log.warning('贝果失败重开：%s；整体重试已用 %s/%s',
                         self.failure_reason, self.failure_retries_used, self.config.max_failure_retries)
+        # 入场前先把按键全松一次：上一局无论是正常收尾、异常中断还是人工停止，
+        # 残留的方向键都会让角色在这一局一开始就自己往一侧跑。
+        try:
+            release_all_keys(self.ctx.controller)
+        except Exception:
+            log.error('贝果入场前松开按键失败', exc_info=True)
         log.info('贝果收集：准备第 %s 次入场', self.attempts + 1)
         self._stats.start_round(self.attempts + 1)
         self._round_ledger = None

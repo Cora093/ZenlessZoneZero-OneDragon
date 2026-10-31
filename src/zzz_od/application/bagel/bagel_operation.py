@@ -9,6 +9,7 @@ from one_dragon.base.operation.operation import Operation
 from one_dragon.utils import str_utils
 from one_dragon.utils.i18_utils import gt
 from one_dragon.utils.log_utils import log
+from zzz_od.application.bagel.bagel_input_worker import release_all_keys
 from zzz_od.application.bagel.bagel_log import BagelRoundLog
 from zzz_od.operation.zzz_operation import ZOperation
 
@@ -200,4 +201,10 @@ class BagelOperation(ZOperation):
             log.error('保存贝果失败截图时发生异常', exc_info=True)
         finally:
             self.ctx.run_context.event_bus.unlisten_all_event(self)
+            # 任何贝果子操作收尾都松一次键：异常中断时子操作可能没走到自己的收尾，
+            # 残留的方向键会被系统一直按住，下一局开局就跑偏。
+            try:
+                release_all_keys(self.ctx.controller)
+            except Exception:
+                log.error('贝果收尾松开按键失败', exc_info=True)
             super().after_operation_done(result)
