@@ -3,8 +3,9 @@
 流程：
 1. 先 H 滤黄、再 S 滑窗求镜头朝向：圆心用几何中心 (100, 100)，
    即角色位置，不再检测菱形；H 14~34 先拦掉
-   白天蓝底，门内每圈 360 点取 S 剖面，117 度宽的楔子滑一圈，
-   楔内 S 和最大的位置即朝向。先取 23、28 两圈，
+   白天蓝底，门内每圈 360 点取 S 剖面，117 点宽的楔子滑一圈，
+   楔内 S 和最大的位置即朝向；并列最高时取连续并列段的中点，
+   起点到中线加 (117 - 1) / 2 度。先取 23、28 两圈，
    差 3 度内直接平均收；否则按甜点区顺序加圈，出现 3 圈互差 4 度内即平均收。
    黄底上门约等于直通，退化成纯 S；白天门把蓝底拦掉才不偏。
 
@@ -65,6 +66,9 @@ def _ring_estimate(
 ) -> float:
     """单圈估计：该圈黄门内 S 剖面上楔内和最大的中线。
 
+    多个起点并列最高时，取包含第一个最大值的连续并列段的中点；
+    全圈同分时没有可用方向，退回第一个起点。
+
     Args:
         field: 黄门内 S（门外已置零）。
         center_x: 固定圆心 x。
@@ -89,7 +93,19 @@ def _ring_estimate(
     cumsum = np.cumsum(np.insert(extended, 0, 0.0))
     sums = cumsum[window:window + count] - cumsum[:count]
     index = int(np.argmax(sums))
-    return float((index * SECTOR_STEP_DEGREE + SECTOR_WEDGE_WIDTH / 2) % 360.0)
+    # 楔子比该圈黄色宽时，相邻多个起点都能罩全黄色、得分并列。
+    # 取第一个会让读数整体偏小，改取连续并列段的圆周中点。
+    # 得分是整数相加，可以直接比较相等。
+    is_top = sums == sums[index]
+    start = end = index
+    if not is_top.all():
+        while is_top[(start - 1) % count]:
+            start -= 1
+        while is_top[(end + 1) % count]:
+            end += 1
+    middle = (start + end) / 2
+    # window 个点首尾只跨 window - 1 个步长，中线离起点 (window - 1) / 2 个步长。
+    return float(((middle + (window - 1) / 2) * SECTOR_STEP_DEGREE) % 360.0)
 
 
 def _sector_angle(
