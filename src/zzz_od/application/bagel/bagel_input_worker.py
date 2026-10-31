@@ -31,6 +31,8 @@ from zzz_od.game_data.map_locator.minimap_angle import analyze
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from cv2.typing import MatLike
+
     from zzz_od.context.zzz_context import ZContext
 
 TAP_INTERACT: str = 'tap_interact'
@@ -58,7 +60,7 @@ SCREEN_CENTER: Point = Point(960, 540)
 """画面中心，点它推进对话。按 1080p 基准。"""
 
 TURN_STABLE_FRAMES: int = 3
-"""连续这么多帧朝向不动，才认为画面稳定、可以开始下一次转向。"""
+"""连续这么多帧朝向不动，才认为画面稳定、可以开始下一次转向。同一张缓存截图只算一帧。"""
 
 TURN_STABLE_JITTER: float = 1.0
 """防抖：相邻两帧朝向差在它以内算没动。静止实测抖动 0.2 度，取 1 度是识别精度。"""
@@ -224,15 +226,15 @@ class _TurnWorker:
 
     def __init__(
         self, handler: Callable[[float], None],
-        sampler: Callable[[], float | None],
+        sampler: Callable[[], tuple[bool, float | None]],
     ) -> None:
         """
         Args:
             handler: 执行一次转向的函数，参数是换算后的实际下发角。
-            sampler: 采一帧当前镜头朝向；读不到返回 None。
+            sampler: 采一帧当前镜头朝向，返回 (是否新截图, 朝向)；读不到朝向时朝向为 None。
         """
         self._handler: Callable[[float], None] = handler
-        self._sampler: Callable[[], float | None] = sampler
+        self._sampler: Callable[[], tuple[bool, float | None]] = sampler
         self._target: float | None = None
         """主线给的最新目标方向；None 表示暂停转向。"""
         self._target_at: float = 0.0
@@ -347,10 +349,13 @@ class _TurnWorker:
                 # 下发后静默期内不截图：这段的样本本来就丢掉，采了也是浪费。
                 continue
             try:
-                current = self._sampler()
+                fresh, current = self._sampler()
             except Exception:
                 log.error('贝果转向采样朝向失败', exc_info=True)
-                current = None
+                fresh, current = True, None
+            if not fresh:
+                # 截图缓存返回了上一张图：这轮当作没采，历史和静止计时都不动。
+                continue
             with self._lock:
                 if self._stopping:
                     return
@@ -535,6 +540,8 @@ class BagelInputWorker:
         """实际状态：S 键现在是否真的按着。"""
         self._backward_lock: threading.Lock = threading.Lock()
         self._stopping: bool = False
+        self._last_turn_screen: MatLike | None = None
+        """转向线程上次拿到的截图，用来跳过截图缓存返回的同一张图。只在转向线程里读写。"""
 
         self._turn_worker: _TurnWorker = _TurnWorker(self._run_turn, self._sample_angle)
         self._instant_channel: _InstantChannel = _InstantChannel(
@@ -771,18 +778,41 @@ class BagelInputWorker:
 
     # ---------- 转向通道 ----------
 
-    def _sample_angle(self) -> float | None:
-        """转向线程自己采一帧当前镜头朝向；读不到返回 None。
+    def _sample_angle(self) -> tuple[bool, float | None]:
+        """转向线程自己采一帧当前镜头朝向。
 
-        用独立截图，不干扰主线截图策略；裁剪与识别与主线同区域同函数。
-        异常只返回 None，由调用方清空历史，不抛出去杀线程。
+        用独立截图，不干扰主线截图策略。
+
+        Returns:
+            (是否新截图, 朝向)。截图缓存返回上一张图时为 (False, None)，
+            调用方跳过这轮；截图失败或读不到朝向时为 (True, None)。
         """
         try:
             screen = self.ctx.controller.get_screenshot(independent=True)
         except Exception:
-            return None
+            return True, None
         if screen is None:
-            return None
+            return True, None
+        # 截图缓存 1/30 秒内返回同一个图像对象，主线提交目标又会提前唤醒转向线程。
+        # 不去重时三次读数可能来自同一张图，镜头还在转就判稳。
+        # 这里一直持有上一张图的引用，新图不会复用它的地址，用 is 比较不会误报。
+        if screen is self._last_turn_screen:
+            return False, None
+        self._last_turn_screen = screen
+        return True, self._read_angle(screen)
+
+    def _read_angle(self, screen: MatLike) -> float | None:
+        """从整屏截图裁出小地图并读镜头朝向；读不到返回 None。
+
+        裁剪与识别与主线同区域同函数。
+        异常只返回 None，由调用方清空历史，不抛出去杀线程。
+
+        Args:
+            screen: 整屏截图。
+
+        Returns:
+            镜头朝向角度；读不到时为 None。
+        """
         try:
             area = self.ctx.screen_loader.get_area('贝果-局内', '定位小地图')
         except Exception:
