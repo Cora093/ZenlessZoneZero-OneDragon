@@ -87,16 +87,18 @@ STOP_TURN_CAP: float = 180.0
 """停车转的单次上限（度）：偏差多大就一把转到位，最大 180 度（掉头）。"""
 
 STOP_TURN_CAP_WARMUP: float = 45.0
-"""比例未知时用的保守上限（度）：一次别甩太大。"""
+"""比例还没攒够样本时用的保守上限（度）：一次别甩太大。"""
 
 TURN_CAP_TRUST_SAMPLES: int = 3
 """攒够这么多个样本才放宽到 STOP_TURN_CAP。"""
 
-CRUISE_TURN_CAP: float = 15.0
-"""边走边转的单次上限（度）：只做小幅修正，剩下的下一轮再补。"""
+CRUISE_TURN_CAP: float = 30.0
+"""边走边转的单笔上限（度）。仓内既有口径：world_patrol 45 度、bagel_navigate 30 度。"""
 
-TURN_CRUISE_LIMIT: float = 10.0
-"""偏差在它以内是边走边转，对应主线束角；超过它才停车转。"""
+TURN_CRUISE_LIMIT: float = 45.0
+"""偏差在它以内一律边走边转，超过它才停车转。仓内既有口径：world_patrol 与
+bagel_navigate 都是「只有超过 90 度才停」，这里取 45 度更保守，配合 30 度单笔上限，
+转角处可以边走边掰过去，不用停下来等。"""
 
 TURN_RATIO_PEAK_BIN_WIDTH: float = 0.05
 """实时校准分箱宽度：箱以 1.0 为中心（如 0.975~1.025），每样本只做一次槽计数加一与峰值比较。"""
@@ -125,6 +127,23 @@ TURN_RATIO_MIN_ANGLE: float = 3.0
 
 TURN_RATIO_MIN_DELTA: float = 0.5
 """实际转角小于它视为画面还没跟上，样本留到下一轮再算。"""
+
+SEED_RATIO_MIN: float = 0.70
+"""跨局继承的补偿比例下限：留出余量，坏值不至于把本局转向带偏。"""
+
+SEED_RATIO_MAX: float = 1.43
+"""跨局继承的补偿比例上限。"""
+
+
+def _clamp_ratio(value: float) -> float:
+    """把传入的补偿比例夹到可信区间；非数或异常值回落 1.0。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not (number > 0.0) or number != number:  # NaN / 负数 / 0
+        return 1.0
+    return max(SEED_RATIO_MIN, min(number, SEED_RATIO_MAX))
 
 
 class _Command:
@@ -225,11 +244,14 @@ class _TurnWorker:
     def __init__(
         self, handler: Callable[[float], None],
         sampler: Callable[[], float | None],
+        seed_ratio: float = 1.0,
     ) -> None:
         """
         Args:
             handler: 执行一次转向的函数，参数是换算后的实际下发角。
             sampler: 采一帧当前镜头朝向；读不到返回 None。
+            seed_ratio: 上一局收敛的补偿比例；每局新建线程时用，
+                省掉开局几次「比例还没学到」的偏转。
         """
         self._handler: Callable[[float], None] = handler
         self._sampler: Callable[[], float | None] = sampler
@@ -251,8 +273,9 @@ class _TurnWorker:
         """上次下发的时刻；宽限内画面没变化不计数。"""
         self._still_since: float | None = None
         """宽限过后首次看到画面没动的时刻；超时只放行下一笔，不碰校准。"""
-        self.turn_ratio: float = 1.0
-        """转向校准值：名义转角乘它就是实际转角，1.0 表示还没校准过。任何时候都不重置。"""
+        self.turn_ratio: float = _clamp_ratio(seed_ratio)
+        """转向校准值：名义转角乘它就是实际转角，1.0 表示还没校准过。
+        每局新建线程时用上一局收敛值做初值（seed_ratio），省掉开局几次偏转。"""
         self.turn_samples: int = 0
         """已累积的校准样本数，用于日志观察。"""
         self._peak_bins: dict[int, int] = {}
@@ -512,10 +535,11 @@ class _TurnWorker:
 class BagelInputWorker:
     """路线执行的全部按键都经由这里下发，主线只投递不等待。"""
 
-    def __init__(self, ctx: ZContext) -> None:
+    def __init__(self, ctx: ZContext, seed_ratio: float = 1.0) -> None:
         """
         Args:
             ctx: 运行上下文，提供控制器。
+            seed_ratio: 上一局收敛的转向补偿比例，作为本局初值。
         """
         self.ctx: ZContext = ctx
         self._forward_want: bool = False
@@ -536,7 +560,9 @@ class BagelInputWorker:
         self._backward_lock: threading.Lock = threading.Lock()
         self._stopping: bool = False
 
-        self._turn_worker: _TurnWorker = _TurnWorker(self._run_turn, self._sample_angle)
+        self._turn_worker: _TurnWorker = _TurnWorker(
+            self._run_turn, self._sample_angle, seed_ratio=seed_ratio,
+        )
         self._instant_channel: _InstantChannel = _InstantChannel(
             'bagel-instant', self._run_instant,
         )
@@ -640,6 +666,11 @@ class BagelInputWorker:
     def turn_scale_samples(self) -> list[float]:
         """本局补偿比例原始样本，供局末峰值平均写回现有灵敏度字段。"""
         return list(self._turn_worker._scale_samples)
+
+    @property
+    def turn_ratio(self) -> float:
+        """本局当前收敛的实时补偿比例；局末存下来供下一局开局直接用。"""
+        return self._turn_worker.turn_ratio
 
     def idle(self) -> bool:
         """即时动作是否空闲；前进短按状态需单独检查。

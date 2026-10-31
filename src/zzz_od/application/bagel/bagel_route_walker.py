@@ -20,7 +20,8 @@
 from __future__ import annotations
 
 import time
-from math import atan2, cos, degrees, floor, hypot, radians, sin
+from math import atan2, cos, degrees, hypot, radians, sin, sqrt
+from statistics import median
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -154,23 +155,36 @@ SLOW_STEP_PRESS: float = 0.5
 SLOW_STEP_WAIT: float = 0.1
 """慢步投递后重新观察的间隔（秒）；短按未结束时不叠发下一步。"""
 
-TURN_SCALE_LESSON_SAMPLES: int = 10
-"""至少攒到这么多个有效样本，才认为整局中位数可信。
+TURN_SCALE_LESSON_SAMPLES: int = 8
+"""单局至少攒到这么多个有效样本，才把本局样本并入跨局累积池。
 
-一局十几个大转角实际只有 13~15 条有效样本，门槛取 20 等于永远不保存。
+每局都会新建 walker 和输入线程，样本天然按局清零；统计能力靠跨局累积池提供，
+所以这里只挡明显不够一局（例如才走了两三个点）的情况。"""
+
+TURN_SCALE_MIN_CHANGE: float = 0.05
+"""写回门槛的下限：偏离 1.0 不到 5% 一律不写，再低就只是噪声。"""
+
+TURN_SCALE_SIGNIFICANCE: float = 3.0
+"""写回门槛按标准误算：偏离要超过「这么多倍标准误」才认。
+
+样本是逐局累积的（存在 config/bagel/turn_scale_samples.yml），标准误随样本数开方下降：
+刚装机、灵敏度差 20% 的机器第一局就会写；累计够了以后门槛降到 2~3%，才追得动真实漂移。
 """
 
-TURN_SCALE_DRIFT_TOLERANCE: float = 0.15
-"""前后半局中位数差超过它就认为还没稳定，不保存。"""
+TURN_SCALE_EVIDENCE_SAMPLES: float = 40.0
+"""写回步长的「半程点」：实际走 peak_count/(peak_count+它) 步。
 
-TURN_SCALE_MIN_CHANGE: float = 0.03
-"""与本次初值差不到这么多就不写盘：实测每局的改进只有 0.03~0.06，门槛取大就永远写不进去。"""
-
-TURN_SCALE_PEAK_BIN_WIDTH: float = 0.05
-"""峰值箱的分箱宽度：箱以 1.0 为中心（如 0.975~1.025），取个数最多的箱的区间中点。"""
+刚装机只有一局证据时只走 1/3，证据攒够才敢整步靠近，避免把单局噪声抄进 turn_dx。
+"""
 
 TURN_SCALE_BOUNDS: tuple[float, float] = (0.55, 1.95)
 """可信的补偿比例范围；超出说明样本被别的动作污染，存了也是错的。"""
+
+TURN_SCALE_SEED_SAMPLES: int = 8
+"""从累积池取初值至少要这么多样本：再少，中位数还不如上一局的比例准。"""
+
+TURN_SCALE_SEED_SPREAD: float = 0.15
+"""累积池离散度上限：超过它说明混进了被打断的脏样本，退回上一局的比例。"""
 
 ANGLE_FAIL_SECONDS: float = 10.0
 """连续读不到镜头朝向超过这个时长才判失败（用户给定 10 秒）。
@@ -178,12 +192,21 @@ ANGLE_FAIL_SECONDS: float = 10.0
 单帧读不到是常事（转视角、贴墙、扇形被挡），不能立刻中断整条路线。
 """
 
-WALK_TURN_ANGLE: float = 10.0
-"""束角（用户术语）：朝向偏差在它以内不松前进键，边走边转微调。
+WALK_TURN_ANGLE: float = 90.0
+"""束角：偏差超过它才松前进键停车转，其余靠边走边转掰过去。
 
-转向线程 5 度内算对准不转，所以 5~10 度是边走边修，超过 10 度停车等转。
-同时走和大角度转会互相干扰，表现为原地乱转，所以大偏差必须先松键。
-"""
+仓内既有实现（world_patrol、bagel_navigate）同样取 90 度。"""
+
+CRUISE_ALIGN_LIMIT: float = 30.0
+"""前进闸门：偏差超过它就松键先原地对准，不按住前进。
+
+取 30 度＝边走边转的单笔上限，一笔即可回到闸门内；偏差更大时按住前进是斜着
+往墙里冲。"""
+
+SPRINT_ALIGN_LIMIT: float = 15.0
+"""冲刺闸门：偏差在它以内才冲刺，闸门外走普通速度。
+
+冲刺会把边走边转的横向漂移成倍放大。"""
 
 SMALL_STEP_PRESS: float = 0.08
 """碎步单次按压时长（秒）。"""
@@ -274,21 +297,24 @@ def _closest_on_segment(
     return (start.x + t * dx, start.y + t * dy)
 
 
-def peak_bin_midpoint(samples: list[float], bin_width: float) -> tuple[float, int]:
-    """全程补偿比例的峰值箱中点：箱以 1.0 为中心，取个数最多的箱的区间中点。
+def _robust_spread(samples: list[float]) -> float:
+    """样本的稳健标准差估计（四分位距换算），用来算写回门槛。
+
+    用 IQR 而不是标准差：单局里偶尔会有 2.16 这种被别的动作污染的样本，
+    标准差会被它放大好几倍，IQR 不受影响。
 
     Args:
-        samples: 全程原始补偿比例样本。
-        bin_width: 分箱宽度，必须大于零。
+        samples: 补偿比例样本。
 
     Returns:
-        峰值箱区间中点与该箱内样本数。
+        稳健标准差，夹在 [0.05, 0.60] 之间，样本不足时按上限保守处理。
     """
-    bins: dict[int, list[float]] = {}
-    for value in samples:
-        bins.setdefault(floor((value - 1.0) / bin_width + 0.5 + 1e-9), []).append(value)
-    peak_key = max(bins, key=lambda key: len(bins[key]))
-    return (1.0 + peak_key * bin_width, len(bins[peak_key]))
+    values = sorted(samples)
+    if len(values) < 8:
+        return 0.60
+    low = values[len(values) // 4]
+    high = values[len(values) * 3 // 4]
+    return min(0.60, max(0.05, (high - low) / 1.349))
 
 
 class BagelRouteWalker(BagelOperation):
@@ -380,7 +406,9 @@ class BagelRouteWalker(BagelOperation):
         """当前电梯阶段的起始时刻，用于计时。"""
         self.elevator_last_tap: float = 0.0
         """上次为推进对话而点按的时刻，控制每秒一次。"""
-        self.input_worker: BagelInputWorker = BagelInputWorker(ctx)
+        self.input_worker: BagelInputWorker = BagelInputWorker(
+            ctx, seed_ratio=self._seed_turn_ratio(),
+        )
         """按键单独线程：主线投递即返回；同种操作不打断自己，不同操作打断旧的。"""
         self.ledger: BagelSafeLedger = BagelSafeLedger()
         """本局安全箱物品，只用于统计日志。"""
@@ -1205,8 +1233,7 @@ class BagelRouteWalker(BagelOperation):
         """远距离移动：只提交目标方向，前进键自己管。
 
         转向全由转向线程负责（稳 3 帧、5 度以上才转）。这里只按本轮
-        偏差管前进：超过 10 度松键停车等转，以内按住走。
-        同时走和大角度转会互相干扰，表现为原地乱转。
+        偏差管前进：超过闸门松键先对准，闸门内按住走，对准了才冲刺。
 
         近距离不再按角度停车转：这个距离上的目标方位由定位抖动决定，
         停下车来按它转只会原地打摆，改成边走边转（线程内限幅 15 度）。
@@ -1220,17 +1247,27 @@ class BagelRouteWalker(BagelOperation):
         angle_diff = cal_utils.angle_delta(controller_angle, target_angle)
         distance = hypot(point.x - position[0], point.y - position[1])
         near = distance <= NEAR_STEP_TURN_RADIUS
-        self._submit_turn(target_angle, cruise_only=near, deadband=TURN_DEADBAND_FAST)
-        if abs(angle_diff) > WALK_TURN_ANGLE and not near:
-            # 大偏差：松键停车等转向线程转到位再走。
+        stopping = abs(angle_diff) > WALK_TURN_ANGLE and not near
+        aligning = abs(angle_diff) > CRUISE_ALIGN_LIMIT and not near
+        # 停车转要对准到 2 度；边走边修不追 2 度——移动中下发实测散布 5.6%（静止 1.1%），
+        # 死区比自身噪声还小就会一直补笔，每个点下发 2~7 笔。
+        self._submit_turn(
+            target_angle, cruise_only=near,
+            deadband=TURN_DEADBAND_FAST if stopping else TURN_DEADBAND,
+        )
+        if aligning:
+            # 松键把镜头掰进闸门再走：边走边转期间角色沿镜头方向前进，
+            # 大偏差下按住前进就是斜着冲出去撞墙。
             self._release_forward()
-            return self.round_wait(f'停车等转向 {angle_diff:.0f}度')
+            if stopping:
+                return self.round_wait(f'停车等转向 {angle_diff:.0f}度')
+            return self.round_wait(f'停车对准 {angle_diff:.0f}度')
         stuck = self._check_stuck(position, point, controller_angle)
         if stuck is not None:
             return stuck
         if self.input_worker.hold_forward():
             self._record_input()
-        self._set_sprint(distance)
+        self._set_sprint(distance, aligned=abs(angle_diff) <= SPRINT_ALIGN_LIMIT)
         return self.round_wait('冲刺前进' if self.sprinting else '按住前进')
 
     def _submit_turn(self, target: float, cruise_only: bool = False, deadband: float = TURN_DEADBAND) -> None:
@@ -1247,45 +1284,122 @@ class BagelRouteWalker(BagelOperation):
         """
         self.input_worker.submit_turn(target, cruise_only=cruise_only, deadband=deadband)
 
-    def persist_turn_scale(self) -> None:
-        """把本局学到的补偿比例写回现有灵敏度字段 turn_dx，供下一局直接用。
+    def _seed_turn_ratio(self) -> float:
+        """取本局补偿比例初值：累积池够用就用池中位数，否则退回上一局的比例。
 
-        全程原始样本按箱宽分箱，取个数最多的箱的区间中点；远离峰值的脏样本
-        够不着峰值直接丢掉。超出可信范围、或与 1.0 几乎一样时不写盘。
-        不再写 config/bagel/turn_scale.yml，直接改现有 turn_dx 字段。
+        上一局存的是单局估计（局间方差约 ±5%），池中位数收敛得多，用它起步能省掉
+        开局几笔大角的偏差。
+
+        Returns:
+            本局转向线程的补偿比例初值。
+        """
+        turn_dx = self.ctx.game_config.turn_dx
+        samples = self._load_turn_scale_samples(turn_dx)
+        if len(samples) >= TURN_SCALE_SEED_SAMPLES:
+            seed = float(median(samples))
+            spread = _robust_spread(samples)
+            min_scale, max_scale = TURN_SCALE_BOUNDS
+            if spread <= TURN_SCALE_SEED_SPREAD and min_scale <= seed <= max_scale:
+                log.info(
+                    '贝果转向本局用累积池中位数 %.3f 起步（%s 样本，离散 %.3f）',
+                    seed, len(samples), spread,
+                )
+                return seed
+        try:
+            ratio = self.store.load_turn_ratio(turn_dx)
+        except Exception:
+            log.warning('读转向补偿比例失败，本局从 1.0 开始学', exc_info=True)
+            return 1.0
+        log.info('贝果转向本局沿用上局补偿比例 %.3f 起步', ratio)
+        return ratio
+
+    def persist_turn_scale(self) -> None:
+        """把累积学到的补偿比例写回灵敏度字段 turn_dx，供下一局直接用。
+
+        样本逐局累积到 config/bagel/turn_scale_samples.yml：单局只有二十来个样本时
+        补偿估计的 1σ 有 ±10~20%，拿单局结果直接写就会让 turn_dx 在两局之间来回摆
+        （实测两分钟内 -3.527 → -3.333 → -3.645）。所以：
+        - 每局把静止下发的样本并进累积池（turn_dx 变了就作废重来）；
+        - 用峰值箱估补偿，脏样本够不着峰值自然丢掉；
+        - 偏离超过「3 倍标准误」（且不低于 5%）才写，标准误随样本累计开方下降，
+          所以刚装机灵敏度差 20% 的第一局就会写，累计够了才追得动 2~3% 的真实漂移；
+        - 步长按 峰值样本数/(峰值样本数+40) 走，证据少时只挪一小步；
+        - 写成功后清空累积池，让新灵敏度重新累积。
         """
         samples = self.input_worker.turn_scale_samples
         if len(samples) < TURN_SCALE_LESSON_SAMPLES:
+            log.info('贝果转向补偿本局只有 %s 条静止下发样本，不够 %s，跳过写回',
+                     len(samples), TURN_SCALE_LESSON_SAMPLES)
             return
-        scale, peak_count = peak_bin_midpoint(samples, TURN_SCALE_PEAK_BIN_WIDTH)
+        old_dx = float(self.ctx.game_config.turn_dx)
+        history = self._load_turn_scale_samples(old_dx)
+        merged = history + samples
+        scale = median(merged)
         min_scale, max_scale = TURN_SCALE_BOUNDS
         if not min_scale <= scale <= max_scale:
             log.info('贝果转向校准值 %.3f 超出可信范围，不写回 turn_dx', scale)
             return
-        if abs(scale - 1.0) < TURN_SCALE_MIN_CHANGE:
+
+        spread = _robust_spread(merged)
+        need = max(TURN_SCALE_MIN_CHANGE, TURN_SCALE_SIGNIFICANCE * spread / sqrt(len(merged)))
+        if abs(scale - 1.0) < need:
+            self._save_turn_scale_samples(old_dx, merged)
+            self._save_turn_ratio(old_dx)
+            log.info(
+                '贝果转向补偿 %.3f 偏离不足门槛 %.3f（累计 %s 样本），先累积不写回',
+                scale, need, len(merged),
+            )
             return
-        old_dx = self.ctx.game_config.turn_dx
-        new_dx = round(float(old_dx) * float(scale), 6)
+
+        weight = len(merged) / (len(merged) + TURN_SCALE_EVIDENCE_SAMPLES)
+        step = float(scale) ** weight
+        new_dx = round(old_dx * step, 6)
         try:
             self.ctx.game_config.turn_dx = new_dx
         except Exception:
             log.error('转向补偿写回 turn_dx 失败', exc_info=True)
             return
+        self._save_turn_scale_samples(new_dx, [])
         log.info(
-            '贝果转向补偿比例 %.3f 已写回 turn_dx（%.4f → %.4f，峰值 %s/%s 样本），下一局直接用',
-            scale, old_dx, new_dx, peak_count, len(samples),
+            '贝果转向补偿 %.3f 已写回 turn_dx（%.4f → %.4f，走 %.3f 步，门槛 %.3f，'
+            '累计 %s 样本），下一局直接用',
+            scale, old_dx, new_dx, step, need, len(merged),
         )
+        self._save_turn_ratio(new_dx)
 
-    def _set_sprint(self, distance: float) -> None:
-        """按距离决定是否冲刺。
+    def _save_turn_ratio(self, turn_dx: float) -> None:
+        """把本局收敛的实时补偿比例存下来，供下一局开局直接用。"""
+        try:
+            self.store.save_turn_ratio(turn_dx, self.input_worker.turn_ratio)
+        except Exception:
+            log.warning('写转向补偿比例失败', exc_info=True)
+
+    def _load_turn_scale_samples(self, turn_dx: float) -> list[float]:
+        """读跨局累积样本；损坏或灵敏度被改过都当空池，不影响本局运行。"""
+        try:
+            return self.store.load_turn_scale_samples(turn_dx)
+        except Exception:
+            log.warning('读转向补偿累积样本失败，按空池处理', exc_info=True)
+            return []
+
+    def _save_turn_scale_samples(self, turn_dx: float, samples: list[float]) -> None:
+        """写跨局累积样本；写失败只影响下一局的收敛速度。"""
+        try:
+            self.store.save_turn_scale_samples(turn_dx, samples)
+        except Exception:
+            log.warning('写转向补偿累积样本失败', exc_info=True)
+
+    def _set_sprint(self, distance: float, aligned: bool = True) -> None:
+        """按距离和朝向决定是否冲刺。
 
         绝区零里冲刺是「按住方向键 + 连点闪避」，所以冲刺时持续点闪避，
         不需要按住闪避键。
 
         Args:
             distance: 距当前目标点的距离。
+            aligned: 朝向是否已经进入冲刺闸门；没对准就先走普通速度。
         """
-        want = distance > SPRINT_DISTANCE
+        want = distance > SPRINT_DISTANCE and aligned
         if want:
             self.sprinting = True
             self._dodge_tap()

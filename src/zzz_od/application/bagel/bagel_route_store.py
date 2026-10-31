@@ -55,6 +55,9 @@ SAMPLE_SUFFIX: str = '.sample.route.json'
 ROUTE_SUFFIX: str = '.route.json'
 """路线文件后缀；自定义路线只用这个后缀。"""
 
+TURN_SCALE_SAMPLES_CAP: int = 400
+"""跨局累积的转向补偿样本上限；20 局左右足够把噪声压到 2% 以内。"""
+
 CUSTOM_PREFIX: str = 'custom_'
 """自定义路线标识前缀。"""
 
@@ -143,6 +146,8 @@ class BagelRouteStore:
         self.config_dir: Path = self.work_dir.joinpath(*CONFIG_DIR)
         self.routes_dir: Path = self.config_dir / 'routes'
         self.settings_path: Path = self.config_dir / 'route_settings.yml'
+        self.turn_scale_samples_path: Path = self.config_dir / 'turn_scale_samples.yml'
+        self.turn_ratio_path: Path = self.config_dir / 'turn_ratio.yml'
         self.legacy_dir: Path = self.work_dir / LEGACY_DIR_NAME
         self.spawn_path: Path = self.work_dir.joinpath(*SPAWN_FILE)
 
@@ -556,6 +561,89 @@ class BagelRouteStore:
                 )
 
         _atomic_write(path, text, check)
+
+    def load_turn_scale_samples(self, turn_dx: float) -> list[float]:
+        """读出跨局累积的转向补偿样本；灵敏度被人改过就作废重来。
+
+        样本是「名义/实际」，只对写样本时的 turn_dx 成立：turn_dx 变了（手动改灵敏度、
+        换机器导入配置）旧样本就没有意义，直接丢掉重新累积。
+
+        Args:
+            turn_dx: 当前灵敏度。
+
+        Returns:
+            累积样本；文件不存在、损坏或 turn_dx 对不上时为空列表。
+        """
+        try:
+            data = yaml.safe_load(self.turn_scale_samples_path.read_text(encoding='utf-8'))
+            if not isinstance(data, dict):
+                return []
+            saved_dx = data.get('turn_dx')
+            if saved_dx is None or abs(float(saved_dx) - float(turn_dx)) > abs(float(turn_dx)) * 0.02:
+                return []
+            raw = data.get('samples')
+            if not isinstance(raw, list):
+                return []
+            values = [float(v) for v in raw]
+        except (OSError, yaml.YAMLError, TypeError, ValueError):
+            return []
+        return values[-TURN_SCALE_SAMPLES_CAP:]
+
+    def save_turn_scale_samples(self, turn_dx: float, samples: list[float]) -> None:
+        """写入跨局累积的转向补偿样本（只留最近这么多个）。"""
+        data = {
+            'version': SETTINGS_VERSION,
+            'turn_dx': round(float(turn_dx), 6),
+            'samples': [round(float(v), 6) for v in samples[-TURN_SCALE_SAMPLES_CAP:]],
+        }
+        text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+
+        def check(tmp: Path) -> None:
+            if yaml.safe_load(tmp.read_text(encoding='utf-8')) != data:
+                raise ValueError('读回内容不一致')
+
+        _atomic_write(self.turn_scale_samples_path, text, check)
+
+    def load_turn_ratio(self, turn_dx: float) -> float:
+        """读出上一局收敛的转向补偿比例；turn_dx 变了或文件损坏就返回 1.0。
+
+        每局都会新建输入线程，实时比例本来从 1.0 重新学；继承上一局的值可以省掉
+        开局几次偏转（实测一局前五个点的转角都会差 5~20%）。
+
+        Args:
+            turn_dx: 当前灵敏度；与存档不一致说明灵敏度被改过，旧比例不再成立。
+
+        Returns:
+            补偿比例；没有可用存档时 1.0。
+        """
+        try:
+            data = yaml.safe_load(self.turn_ratio_path.read_text(encoding='utf-8'))
+            if not isinstance(data, dict):
+                return 1.0
+            saved_dx = data.get('turn_dx')
+            if saved_dx is None or abs(float(saved_dx) - float(turn_dx)) > abs(float(turn_dx)) * 0.02:
+                return 1.0
+            ratio = float(data.get('ratio'))
+            if not (0.5 <= ratio <= 2.0):
+                return 1.0
+        except (OSError, yaml.YAMLError, TypeError, ValueError):
+            return 1.0
+        return ratio
+
+    def save_turn_ratio(self, turn_dx: float, ratio: float) -> None:
+        """保存本局收敛的转向补偿比例，供下一局开局直接用。"""
+        data = {
+            'version': SETTINGS_VERSION,
+            'turn_dx': round(float(turn_dx), 6),
+            'ratio': round(float(ratio), 4),
+        }
+        text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+
+        def check(tmp: Path) -> None:
+            if yaml.safe_load(tmp.read_text(encoding='utf-8')) != data:
+                raise ValueError('读回内容不一致')
+
+        _atomic_write(self.turn_ratio_path, text, check)
 
     def _read_settings(self) -> dict[str, BagelRouteRef | None]:
         """读出开启选择；损坏时报错，不回退到默认值。"""
