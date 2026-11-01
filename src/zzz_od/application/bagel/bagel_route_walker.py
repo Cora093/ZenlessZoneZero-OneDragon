@@ -816,6 +816,7 @@ class BagelRouteWalker(BagelOperation):
         locator, score, center = result
         new_position = (float(center[0]), float(center[1]))
         last = self.last_good_position
+        jumped = False
         if last is not None:
             jump = hypot(new_position[0] - last[0], new_position[1] - last[1])
             if jump > MAX_POSITION_JUMP:
@@ -844,12 +845,17 @@ class BagelRouteWalker(BagelOperation):
                     '贝果定位跳变 %.0fpx 已确认（连续 %s 帧，层 %s），按换区域接受',
                     jump, self._jump_candidate_frames, locator.map_id,
                 )
+                jumped = True
         self._jump_candidate = None
         self._jump_candidate_frames = 0
         self._jump_reject_since = None
         self.last_map_id = locator.map_id
         self.last_good_position = new_position
         self.position = new_position
+        # 跳变是瞬移，不是走过的路：不清掉的话下一帧会拿旧区域坐标到新坐标当线段，
+        # 「线段穿过」判据会把附近途径点误判成已到点，游标白白推进一格。
+        if jumped:
+            self.prev_position = None
         return self.position
 
     def _save_locator_jump(self, position: tuple[float, float], jump: float) -> None:
@@ -1591,6 +1597,9 @@ class BagelRouteWalker(BagelOperation):
             crossed = self._path_crosses_point(self.prev_position, position, point)
             if distance <= BEACON_ARRIVE_RADIUS or crossed:
                 self._release_forward()
+                # 八向混合可能还按着 A/D：只松前进键的话角色到点后继续横滑，
+                # 下一格若是途径点或电梯，残留侧移会把人带偏。
+                self.input_worker.stop_strafe()
                 log.info(
                     '贝果到点：第 %s 点判定距离 %.2fpx（判据 %.0fpx%s，位置 %s）',
                     self.cursor + 1, distance, BEACON_ARRIVE_RADIUS,

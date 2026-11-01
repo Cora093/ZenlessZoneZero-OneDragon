@@ -284,12 +284,12 @@ def plan_route(points: list[dict], masks) -> dict[str, list[list[float]]]:
 
 
 def _points_signature(points: list[dict]) -> str:
-    """这条路线点位内容的指纹。
+    """这条路线点位内容（坐标 + 层）的指纹。
 
     缓存只认点数是不够的：路线点数不变、坐标改了（重新录制同一张图的路线很容易出现），
     旧计划会被整条复用——每腿只把末点纠正回新坐标，中间的规划点全是旧的。
     """
-    raw = json.dumps([[p['x'], p['y']] for p in points], sort_keys=True)
+    raw = json.dumps([[p['x'], p['y'], p.get('layer', '')] for p in points], sort_keys=True)
     return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:12]
 
 

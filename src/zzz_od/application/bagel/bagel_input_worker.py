@@ -682,6 +682,8 @@ class BagelInputWorker:
         self._backward_down: bool = False
         """实际状态：S 键现在是否真的按着。"""
         self._backward_lock: threading.Lock = threading.Lock()
+        self._strafe_version: int = 0
+        """侧移意图改过几次：一次性动作让出 A/D 之后靠它判断要不要恢复。"""
         self._strafe_want: int = 0
         """主线意图：侧移方向，1=右(D)，-1=左(A)，0=不按；用于斜向纠偏。"""
         self._strafe_down: int = 0
@@ -740,6 +742,27 @@ class BagelInputWorker:
         """读当前前进意图；给即时动作用，决定动作结束后要不要恢复。"""
         with self._forward_lock:
             return self._forward_want
+
+    def _take_strafe_for_step(self) -> tuple[int, int]:
+        """一次性按 A/D 前先让出侧移通道，返回 (原意图, 版本号)。
+
+        SIDE_STEP / RETREAT_STEP 是直接调 move_a/move_d 的，绕过 _strafe_down 账本；
+        侧移线程以为键还按着就不再补按，之后 hold_strafe 变成空操作，反向时还会两个键
+        同时按着。所以动作前先停侧移线程、让它把键松掉，动作后再按版本号决定要不要恢复。
+        """
+        with self._strafe_lock:
+            want = self._strafe_want
+        if not want:
+            return 0, self._strafe_version
+        self.stop_strafe()
+        version = self._strafe_version
+        time.sleep(STEP_FORWARD_RELEASE_GRACE)
+        return want, version
+
+    def _restore_strafe_after_step(self, want: int, version: int) -> None:
+        """一次性动作结束后恢复侧移意图；期间主线改过意图就不恢复。"""
+        if want and not self._stopping and self._strafe_version == version:
+            self.hold_strafe(want)
 
     def _forward_intent_version(self) -> int:
         """前进意图被改过几次；即时动作靠它判断这期间主线有没有另下指令。"""
@@ -822,11 +845,13 @@ class BagelInputWorker:
         """
         with self._strafe_lock:
             self._strafe_want = 1 if direction > 0 else (-1 if direction < 0 else 0)
+            self._strafe_version += 1
 
     def stop_strafe(self) -> None:
         """松开两个侧移键。"""
         with self._strafe_lock:
             self._strafe_want = 0
+            self._strafe_version += 1
 
     def submit_turn(self, target: float | None, cruise_only: bool = False, deadband: float = TURN_DEADBAND) -> None:
         """提交最新目标方向；只存不定夺，朝向由转向线程自己采样。
@@ -953,10 +978,14 @@ class BagelInputWorker:
         """立刻松掉所有键；停止、暂停等收尾路径都该调它。"""
         with self._forward_lock:
             self._forward_want = False
+            # 版本号一起推进：暂停/停止时正在跑的一次性动作（退让、侧移）不能
+            # 事后按旧版本号把前进键按回去，那会在暂停状态下自己走起来。
+            self._forward_version += 1
         with self._backward_lock:
             self._backward_want = False
         with self._strafe_lock:
             self._strafe_want = 0
+            self._strafe_version += 1
         release_all_keys(self.ctx.controller)
 
     def _forward_loop(self) -> None:
@@ -1179,11 +1208,13 @@ class BagelInputWorker:
             time.sleep(command.duration or 0.0)
             controller.move_s(release=True)
             if command.side_duration > 0:
+                strafe_want, strafe_version = self._take_strafe_for_step()
                 key = controller.move_a if command.angle < 0 else controller.move_d
                 key(press=True)
                 time.sleep(command.side_duration)
                 key(release=True)
-            if want_forward and self._forward_intent_version() == version:
+                self._restore_strafe_after_step(strafe_want, strafe_version)
+            if want_forward and not self._stopping and self._forward_intent_version() == version:
                 self.hold_forward()
             return
         if command.kind == SIDE_STEP:
@@ -1196,11 +1227,13 @@ class BagelInputWorker:
                 self.stop_forward()
                 version = self._forward_intent_version()
                 time.sleep(STEP_FORWARD_RELEASE_GRACE)
+            strafe_want, strafe_version = self._take_strafe_for_step()
             key = controller.move_a if command.angle < 0 else controller.move_d
             key(press=True)
             time.sleep(command.duration or 0.0)
             key(release=True)
-            if want_forward and self._forward_intent_version() == version:
+            self._restore_strafe_after_step(strafe_want, strafe_version)
+            if want_forward and not self._stopping and self._forward_intent_version() == version:
                 self.hold_forward()
             return
         if command.kind == BACK_STEP:
@@ -1215,5 +1248,5 @@ class BagelInputWorker:
             controller.move_s(press=True)
             time.sleep(command.duration or 0.0)
             controller.move_s(release=True)
-            if want_forward and self._forward_intent_version() == version:
+            if want_forward and not self._stopping and self._forward_intent_version() == version:
                 self.hold_forward()
