@@ -689,6 +689,8 @@ class BagelInputWorker:
         self._strafe_down: int = 0
         """实际状态：当前按着哪个侧移键，0 表示都没按。"""
         self._strafe_lock: threading.Lock = threading.Lock()
+        self._action_epoch: int = 0
+        """松键次数：一次性动作靠它在每一段按键前判断自己是否已被作废。"""
         self._stopping: bool = False
         self._last_turn_screen: MatLike | None = None
         """转向线程上次拿到的截图，用来跳过截图缓存返回的同一张图。只在转向线程里读写。"""
@@ -763,6 +765,14 @@ class BagelInputWorker:
         """一次性动作结束后恢复侧移意图；期间主线改过意图就不恢复。"""
         if want and not self._stopping and self._strafe_version == version:
             self.hold_strafe(want)
+
+    def _action_valid(self, epoch: int) -> bool:
+        """一次性动作是否还该继续按后面的段。
+
+        松键（暂停、停止）会把 epoch 推进一格：退让/侧移是多段按键，松键之后
+        再按下一段就会在暂停状态下自己动起来，所以每段按之前都要问一次。
+        """
+        return not self._stopping and self._action_epoch == epoch
 
     def _forward_intent_version(self) -> int:
         """前进意图被改过几次；即时动作靠它判断这期间主线有没有另下指令。"""
@@ -986,6 +996,8 @@ class BagelInputWorker:
         with self._strafe_lock:
             self._strafe_want = 0
             self._strafe_version += 1
+        # 一次性动作是多段按键：作废后连后面还没按的段一起停掉。
+        self._action_epoch += 1
         release_all_keys(self.ctx.controller)
 
     def _forward_loop(self) -> None:
@@ -1199,22 +1211,27 @@ class BagelInputWorker:
             # 退让 = 后退 + 朝目标一侧横移：只后退的话角色还在同一条车道上，
             # 掉头回来必然再卡。两段都在「不按前进」状态下做，做完再恢复前进意图。
             want_forward = self._forward_want_locked()
+            epoch = self._action_epoch
             version = 0
             if want_forward:
                 self.stop_forward()
                 version = self._forward_intent_version()
                 time.sleep(STEP_FORWARD_RELEASE_GRACE)
+            if not self._action_valid(epoch):
+                return
             controller.move_s(press=True)
             time.sleep(command.duration or 0.0)
             controller.move_s(release=True)
-            if command.side_duration > 0:
+            if command.side_duration > 0 and self._action_valid(epoch):
                 strafe_want, strafe_version = self._take_strafe_for_step()
-                key = controller.move_a if command.angle < 0 else controller.move_d
-                key(press=True)
-                time.sleep(command.side_duration)
-                key(release=True)
+                if self._action_valid(epoch):
+                    key = controller.move_a if command.angle < 0 else controller.move_d
+                    key(press=True)
+                    time.sleep(command.side_duration)
+                    key(release=True)
                 self._restore_strafe_after_step(strafe_want, strafe_version)
-            if want_forward and not self._stopping and self._forward_intent_version() == version:
+            if (want_forward and self._action_valid(epoch)
+                    and self._forward_intent_version() == version):
                 self.hold_forward()
             return
         if command.kind == SIDE_STEP:
@@ -1222,31 +1239,40 @@ class BagelInputWorker:
             # 原来「保持前进、侧移变斜向顺墙滑」在实体障碍前实测位移 0~1px（6 次里 4 次为 0），
             # 斜向分量被障碍整个吃掉；松开 W 后才是真的横着挪。
             want_forward = self._forward_want_locked()
+            epoch = self._action_epoch
             version = 0
             if want_forward:
                 self.stop_forward()
                 version = self._forward_intent_version()
                 time.sleep(STEP_FORWARD_RELEASE_GRACE)
+            if not self._action_valid(epoch):
+                return
             strafe_want, strafe_version = self._take_strafe_for_step()
-            key = controller.move_a if command.angle < 0 else controller.move_d
-            key(press=True)
-            time.sleep(command.duration or 0.0)
-            key(release=True)
+            if self._action_valid(epoch):
+                key = controller.move_a if command.angle < 0 else controller.move_d
+                key(press=True)
+                time.sleep(command.duration or 0.0)
+                key(release=True)
             self._restore_strafe_after_step(strafe_want, strafe_version)
-            if want_forward and not self._stopping and self._forward_intent_version() == version:
+            if (want_forward and self._action_valid(epoch)
+                    and self._forward_intent_version() == version):
                 self.hold_forward()
             return
         if command.kind == BACK_STEP:
             # 只按一小段后退：走过头时用来退回路径上，走得越久越容易退到墙里，
             # 所以时长由调用方给死，不在这里自适应。同样要先松 W，否则 W+S 互相抵消。
             want_forward = self._forward_want_locked()
+            epoch = self._action_epoch
             version = 0
             if want_forward:
                 self.stop_forward()
                 version = self._forward_intent_version()
                 time.sleep(STEP_FORWARD_RELEASE_GRACE)
+            if not self._action_valid(epoch):
+                return
             controller.move_s(press=True)
             time.sleep(command.duration or 0.0)
             controller.move_s(release=True)
-            if want_forward and not self._stopping and self._forward_intent_version() == version:
+            if (want_forward and self._action_valid(epoch)
+                    and self._forward_intent_version() == version):
                 self.hold_forward()
