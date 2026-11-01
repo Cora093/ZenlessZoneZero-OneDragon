@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -48,6 +49,23 @@ SECTOR_GROUP_DEGREE: float = 4.0
 """稳定组半径：3 圈互差它以内即收敛取平均。"""
 
 
+@dataclass(frozen=True)
+class SectorTrace:
+    """一次分圈投票的完整过程，给离群帧排查用，不参与任何判定。"""
+
+    sector: float | None
+    """最终朝向；门内全空或计算异常时为 None。"""
+
+    branch: str
+    """取值来源：empty / error / two / group / fallback。"""
+
+    rings: tuple[tuple[int, float], ...]
+    """已计算的每个圈：(半径, 单圈估计)，按取圈顺序。"""
+
+    members: tuple[float, ...]
+    """参与最终平均的单圈估计。"""
+
+
 def _angle_delta(first: float, second: float) -> float:
     """两角度的有符号差，收到 (-180, 180]。"""
     return (first - second + 180.0) % 360.0 - 180.0
@@ -64,6 +82,9 @@ def _ring_estimate(
     field: np.ndarray, center_x: float, center_y: float, radius: float,
 ) -> float:
     """单圈估计：该圈黄门内 S 剖面上楔内和最大的中线。
+
+    多个起点并列最高时，取包含第一个最大值的连续并列段的中点；
+    全圈同分时没有可用方向，退回第一个起点。
 
     Args:
         field: 黄门内 S（门外已置零）。
@@ -89,7 +110,19 @@ def _ring_estimate(
     cumsum = np.cumsum(np.insert(extended, 0, 0.0))
     sums = cumsum[window:window + count] - cumsum[:count]
     index = int(np.argmax(sums))
-    return float((index * SECTOR_STEP_DEGREE + SECTOR_WEDGE_WIDTH / 2) % 360.0)
+    # 楔子比该圈黄色宽时，相邻多个起点都能罩全黄色、得分并列。
+    # 取第一个会让读数整体偏小，改取连续并列段的圆周中点。
+    # 得分是整数和值转成 float64，量级远小于 2^53，比较相等是精确的。
+    is_top = sums == sums[index]
+    start = end = index
+    if not is_top.all():
+        while is_top[(start - 1) % count]:
+            start -= 1
+        while is_top[(end + 1) % count]:
+            end += 1
+    middle = (start + end) / 2
+    # window 个点首尾只跨 window - 1 个步长，中线离起点 (window - 1) / 2 个步长。
+    return float(((middle + (window - 1) / 2) * SECTOR_STEP_DEGREE) % 360.0)
 
 
 def _sector_angle(
@@ -111,6 +144,11 @@ def _sector_angle(
     Returns:
         镜头朝向角度；门内全空（小地图消失）时返回 None。
     """
+    return _trace(rgb, center_x, center_y).sector
+
+
+def _field(rgb: MatLike) -> np.ndarray | None:
+    """H 门内取 S，门外置零；全空（小地图消失）返回 None。"""
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     hue = hsv[:, :, 0].astype(np.float64)
     sat = hsv[:, :, 1].astype(np.float64)
@@ -118,26 +156,52 @@ def _sector_angle(
     field = np.where(yellow, sat, 0.0)
     if float(field.max()) <= 0.0:
         return None
+    return field
+
+
+def _ring_sequence(field: np.ndarray, center_x: float, center_y: float):
+    """按取圈顺序逐个给出单圈估计；懒惰求值，投票提前收就少算几圈。"""
+    for radius in SECTOR_RING_ORDER:
+        yield radius, _ring_estimate(field, center_x, center_y, float(radius))
+
+
+def _vote(rings) -> SectorTrace:
+    """对一串 (半径, 单圈估计) 做分圈投票：两圈差 3 度内直接收，否则凑 3 圈稳定组。"""
+    collected: list[tuple[int, float]] = []
+    values: list[float] = []
+    for radius, value in rings:
+        collected.append((radius, value))
+        values.append(value)
+        if len(values) == 2:
+            if abs(_angle_delta(values[0], values[1])) <= SECTOR_TWO_DIFF:
+                return SectorTrace(
+                    _circular_mean(values), 'two', tuple(collected), tuple(values),
+                )
+        elif len(values) >= 3:
+            for cand in values:
+                members = [
+                    v for v in values
+                    if abs(_angle_delta(v, cand)) <= SECTOR_GROUP_DEGREE
+                ]
+                if len(members) >= 3:
+                    return SectorTrace(
+                        _circular_mean(members), 'group', tuple(collected), tuple(members),
+                    )
+    if not values:
+        return SectorTrace(None, 'empty', tuple(collected), ())
+    return SectorTrace(_circular_mean(values), 'fallback', tuple(collected), tuple(values))
+
+
+def _trace(rgb: MatLike, center_x: float, center_y: float) -> SectorTrace:
+    """按分圈投票算朝向，同时留下每圈估计与取值来源。"""
+    field = _field(rgb)
+    if field is None:
+        return SectorTrace(None, 'empty', (), ())
     try:
-        values: list[float] = []
-        for radius in SECTOR_RING_ORDER:
-            values.append(_ring_estimate(field, center_x, center_y, float(radius)))
-            if len(values) == 2:
-                if abs(_angle_delta(values[0], values[1])) <= SECTOR_TWO_DIFF:
-                    return _circular_mean(values)
-            elif len(values) >= 3:
-                for cand in values:
-                    members = [
-                        v for v in values
-                        if abs(_angle_delta(v, cand)) <= SECTOR_GROUP_DEGREE
-                    ]
-                    if len(members) >= 3:
-                        return _circular_mean(members)
-        if not values:
-            return None
-        return _circular_mean(values)
+        return _vote(_ring_sequence(field, center_x, center_y))
     except Exception:
-        return None
+        return SectorTrace(None, 'error', (), ())
+
 
 
 def analyze(
@@ -163,3 +227,18 @@ def analyze(
 
     sector_value = _sector_angle(rgb, center_x, center_y)
     return None, None, sector_value, 0.0, center
+
+
+def explain(rgb: MatLike) -> SectorTrace:
+    """读朝向并附上分圈投票过程，给离群帧排查用。
+
+    Args:
+        rgb: 小地图 RGB 图，正方形。
+
+    Returns:
+        与 ``analyze`` 同一取值，外加每圈估计与取值来源。
+    """
+    height, width = rgb.shape[:2]
+    center_x = (width - 1) / 2 + SECTOR_CENTER_OFFSET[0]
+    center_y = (height - 1) / 2 + SECTOR_CENTER_OFFSET[1]
+    return _trace(rgb, center_x, center_y)

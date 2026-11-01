@@ -87,6 +87,11 @@ class BagelStoreSafe(BagelOperation):
     # 面板刚打开、以及拖拽后物品落地都有动画，留足时间；每次发出拖拽前会清零，
     # 所以这是「一件物品一次」的预算，不会跨件累计。
     PANEL_WAIT_ROUNDS_LIMIT: int = 10
+    # 判「搜查被打断」要连续这么多帧都成立：单帧同时满足「面板没就绪 + 无标题 +
+    # 无大保险提示 + 能看到普通攻击键」时，物品落地动画或 HUD 遮挡也会让四个条件
+    # 短暂同时成立，实测因此误判过两局（面板明明开着、格子里已经识别出物品）。
+    # 真的被打断会一直成立，多等一帧不会漏判。
+    INTERRUPT_ROUNDS_LIMIT: int = 2
     # 无确认进展与总用时分别限制；进展不能刷新总用时。
     NO_PROGRESS_SECONDS: float = 10.0
     TOTAL_TIMEOUT_SECONDS: float = 30.0
@@ -129,6 +134,7 @@ class BagelStoreSafe(BagelOperation):
         self._logged_items: dict[str, tuple[tuple[int, str, str], ...]] = {}
         self._panel_guard: SearchPanelGuard = SearchPanelGuard()
         self._panel_wait_rounds: int = 0
+        self._interrupt_rounds: int = 0
         self._safe_unknown_rounds: int = 0
         self._paused_usage_time: float | None = None
         self._first_pause_start_time: float | None = None
@@ -183,6 +189,7 @@ class BagelStoreSafe(BagelOperation):
         self._logged_items.clear()
         self._panel_guard.reset()
         self._panel_wait_rounds = 0
+        self._interrupt_rounds = 0
         self._safe_unknown_rounds = 0
 
     def _check_search_panel(self) -> OperationRoundResult | None:
@@ -201,20 +208,28 @@ class BagelStoreSafe(BagelOperation):
             return deadline
         if not self._search_ready():
             self._panel_guard.reset()
-            if (not self._has_search_title()
-                    and not self.round_by_find_area(
-                        self.last_screenshot, '贝果-局内', '大保险解锁提示',
-                    ).is_success
-                    and self.round_by_find_area(
-                        self.last_screenshot, '战斗画面', '按键-普通攻击',
-                    ).is_success):
-                self._clear_pending()
-                return self.round_fail(self.STATUS_INTERRUPTED)
+            interrupted = (
+                not self._has_search_title()
+                and not self.round_by_find_area(
+                    self.last_screenshot, '贝果-局内', '大保险解锁提示',
+                ).is_success
+                and self.round_by_find_area(
+                    self.last_screenshot, '战斗画面', '按键-普通攻击',
+                ).is_success
+            )
+            if interrupted:
+                self._interrupt_rounds += 1
+                if self._interrupt_rounds >= self.INTERRUPT_ROUNDS_LIMIT:
+                    self._clear_pending()
+                    return self.round_fail(self.STATUS_INTERRUPTED)
+            else:
+                self._interrupt_rounds = 0
         elif self._observe_panel():
             centers = self._panel_guard.result_centers
             assert centers is not None
             self._result_centers = centers
             self._panel_wait_rounds = 0
+            self._interrupt_rounds = 0
             return None
         if self._result_layout_changed:
             self._clear_pending()

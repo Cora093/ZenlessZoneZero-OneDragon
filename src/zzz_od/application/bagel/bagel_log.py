@@ -9,6 +9,20 @@ from one_dragon.utils.log_utils import log
 if TYPE_CHECKING:
     from one_dragon.base.operation.operation_round_result import OperationRoundResult
 
+DIAG_ENABLED: bool = True
+"""结构化诊断开关。
+
+记每轮的转角、瞄准点、位置、真实按键状态，供离线核对「能不能一次转到位、
+侧移有没有生效」。调用方必须自己控频率：只在每轮（约 8Hz）或按键变化时打，
+不要在 33Hz 的采样线程里无脑打，日志 I/O 会拖慢主循环。
+"""
+
+
+def diag(text: str) -> None:
+    """打一条结构化诊断日志；时间戳由日志器给。"""
+    if DIAG_ENABLED:
+        log.info('贝果诊断 · %s', text)
+
 
 class BagelRoundLog:
     """按操作实例合并连续相同的等待，保留次数与首末观察时间跨度。"""
